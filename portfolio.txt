@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mahim Trivedi - Robotics Portfolio</title>
+    <meta name="description" content="Mahim Trivedi's professional portfolio showcasing experience in Electrical and Electronics Engineering, substation automation, and AI-driven market research and analytics.">
+    <meta name="keywords" content="Mahim Trivedi, Electrical Engineering, Electronics Engineering, Substation Automation, AI, Market Research, Robotics, Portfolio">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
+        @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css');
+        
+        body {
+            font-family: 'Roboto', sans-serif;
+            margin: 0;
+            padding: 0;
+            color: #fff;
+            background: linear-gradient(135deg, #1e1e2f, #252540);
+            scroll-behavior: smooth;
+            position: relative;
+            overflow-x: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #1e1e2f, #252540);
+            color: #00bfff;
+            text-align: center;
+            padding: 2em 0;
+            border-bottom: 2px solid #00bfff;
+            animation: fadeInDown 1s ease-in-out;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 3em;
+        }
+        .header p {
+            margin: 0.5em 0;
+        }
+        .container {
+            width: 80%;
+            margin: auto;
+            overflow: hidden;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.8);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+            border-radius: 10px;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .section:hover {
+            transform: scale(1.02);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.7);
+        }
+        .section h2 {
+            border-bottom: 2px solid #00bfff;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            position: relative;
+        }
+        .section h2::before {
+            content: "";
+            position: absolute;
+            left: 0;
+            bottom: -2px;
+            width: 50px;
+            height: 2px;
+            background: #00bfff;
+            animation: expand 1s ease-in-out;
+        }
+        .section ul {
+            list-style-type: none;
+            padding: 0;
+        }
+        .section ul li {
+            background: rgba(255, 255, 255, 0.1);
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 5px;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .section ul li:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.7);
+        }
+        .skills ul li {
+            background: #00bfff;
+            color: black;
+            margin: 5px 0;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .footer {
+            background-color: #333;
+            color: white;
+            text-align: center;
+            padding: 10px 0;
+            margin-top: 20px;
+            border-top: 2px solid #00bfff;
+        }
+        .contact-info a {
+            color: #00bfff;
+            text-decoration: none;
+        }
+        .contact-info a:hover {
+            text-decoration: underline;
+        }
+        nav {
+            display: flex;
+            justify-content: center;
+            background: rgba(0, 0, 0, 0.9);
+            padding: 1em 0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            border-bottom: 2px solid #00bfff;
+            animation: fadeInDown 1.4s ease-in-out;
+        }
+        nav a {
+            color: #00bfff;
+            padding: 0 15px;
+            text-decoration: none;
+            font-size: 1.2em;
+            transition: color 0.3s;
+        }
+        nav a:hover {
+            color: #ff80bf;
+        }
+        .portfolio-item {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            margin-bottom: 20px;
+            animation: fadeIn 1.6s ease-in-out;
+        }
+        .portfolio-item img {
+            max-width: 100%;
+            height: auto;
+            border-radius: 10px;
+            margin-right: 20px;
+            max-height: 200px;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .portfolio-item img:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.7);
+        }
+        .portfolio-item .imgur-embed-pub {
+            width: 100%;
+            max-width: 600px;
+        }
+        @media (max-width: 768px) {
+            .container {
+                width: 90%;
+            }
+            .header h1 {
+                font-size: 2em;
+            }
+            nav a {
+                padding: 0 10px;
+                font-size: 1em;
+            }
+            .portfolio-item {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            .portfolio-item img, .portfolio-item .imgur-embed-pub {
+                margin-bottom: 10px;
+                margin-right: 0;
+                width: 100%;
+            }
+        }
+        .back-to-top {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #00bfff;
+            color: white;
+            padding: 10px 15px;
+            border-radius: 50%;
+            text-align: center;
+            display: none;
+            z-index: 1000;
+            transition: background-color 0.3s;
+        }
+        .back-to-top:hover {
+            background: #00a1e0;
+        }
+        .about-me-img {
+            max-width: 150px;
+            border-radius: 50%;
+            margin-right: 20px;
+            border: 2px solid #00bfff;
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+        .about-me-img:hover {
+            transform: scale(1.05);
+            box-shadow: 0 8px 16px rgba(0,0,0,0.7);
+        }
+        .about-me-container {
+            display: flex;
+            align-items: center;
+            animation: fadeIn 2s ease-in-out;
+        }
+        @media (max-width: 768px) {
+            .about-me-container {
+                flex-direction: column;
+                text-align: center;
+            }
+            .about-me-img {
+                margin: 0 0 20px 0;
+            }
+        }
+
+        /* Animations */
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-20px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+            }
+            to {
+                opacity: 1;
+            }
+        }
+        @keyframes expand {
+            from {
+                width: 0;
+            }
+            to {
+                width: 50px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <h1>Mahim Trivedi</h1>
+        <p>Flat 606 Building number 120 Street 6 Discovery Gardens Dubai UAE</p>
+        <p>Email: <a href="mailto:trivedimahim2@gmail.com" style="color: #00bfff;">trivedimahim2@gmail.com</a> | Phone: +971 56 521 5637</p>
+        <p><a href="https://www.linkedin.com/in/mahimtrivedi-313a10131" target="_blank" style="color: #00bfff;">LinkedIn</a></p>
+    </header>
+
+    <nav>
+        <a href="#about"><i class="fas fa-user"></i> About Me</a>
+        <a href="#experience"><i class="fas fa-briefcase"></i> Experience</a>
+        <a href="#education"><i class="fas fa-graduation-cap"></i> Education</a>
+        <a href="#skills"><i class="fas fa-tools"></i> Skills</a>
+        <a href="#portfolio"><i class="fas fa-project-diagram"></i> Portfolio</a>
+        <a href="#certifications"><i class="fas fa-certificate"></i> Licenses & Certifications</a>
+        <a href="#volunteer"><i class="fas fa-hands-helping"></i> Volunteer Experience</a>
+        <a href="#contact"><i class="fas fa-envelope"></i> Contact</a>
+    </nav>
+
+    <a href="#top" class="back-to-top" id="back-to-top"><i class="fas fa-arrow-up"></i></a>
+
+    <div class="container">
+        <section class="section" id="about">
+            <h2>About Me</h2>
+            <div class="about-me-container">
+                <img src="https://i.imgur.com/Dbktkvx.jpg" alt="Mahim Trivedi" class="about-me-img">
+                <p>Experienced professional in Electrical and Electronics Engineering with a focus on substation automation, project management, and AI-driven market research and analytics. Currently pursuing MSc in Robotics at Middlesex University Dubai, with extensive hands-on experience in programming, automation, and technical marketing.</p>
+            </div>
+        </section>
+
+        <section class="section" id="experience">
+            <h2>Experience</h2>
+            <div class="experience-card">
+                <h3>Sales and Marketing Intern - Patient & Health Impact and Oncology (BU Lead)</h3>
+                <p>Pfizer Pharmaceuticals Gulf Dubai | May 2023 – August 2023</p>
+                <ul>
+                    <li>Developed market strategies and conducted comprehensive Gulf market research.</li>
+                    <li>Crafted promotional materials within regulatory frameworks.</li>
+                    <li>Enhanced healthcare professional engagement to further Pfizer’s mission.</li>
+                    <li>Analyzed market trends to inform sales strategies and product positioning.</li>
+                </ul>
+            </div>
+            <div class="experience-card">
+                <h3>Project Engineer - Trainee</h3>
+                <p>Voyage Marine Automation UAE Dubai | March 2022 – May 2023</p>
+                <ul>
+                    <li>Streamlined client inquiry management through effective quoting and costing.</li>
+                    <li>Utilized AutoCAD and SEE Electrical for automation drawing creation.</li>
+                    <li>Orchestrated projects in Marine automation and Firefighting systems.</li>
+                    <li>Conducted on-site inspections to ensure project specifications and safety standards were met.</li>
+                    <li>Collaborated with engineers and technicians to troubleshoot and resolve technical issues.</li>
+                    <li>Prepared and presented project reports to senior management, highlighting key progress and challenges.</li>
+                </ul>
+            </div>
+            <div class="experience-card">
+                <h3>Operations and Technical Marketing Engineer Intern</h3>
+                <p>Schneider Electric UAE Dubai | July 2021 – Sept 2021</p>
+                <ul>
+                    <li>Assisted in operations and marketing of technical products.</li>
+                    <li>Developed Bill of Quantities and explored Schneider’s IoT offerings.</li>
+                    <li>Facilitated customer communication for requirement gathering.</li>
+                    <li>Played a key role in the implementation of marketing campaigns and product launches.</li>
+                    <li>Conducted competitive analysis to benchmark Schneider’s products against industry standards.</li>
+                    <li>Organized and participated in trade shows and corporate events to promote company products.</li>
+                </ul>
+            </div>
+            <div class="experience-card">
+                <h3>Engineering Intern</h3>
+                <p>LARSEN & TOUBRO FZE Dubai | January – June 2020</p>
+                <ul>
+                    <li>Engaged in projects involving Electrical, Automation, and Telecommunication.</li>
+                    <li>Acquired hands-on experience with PLC, HMI, and SCADA panels.</li>
+                    <li>Assisted in the design and implementation of control systems for automation projects.</li>
+                    <li>Provided technical support and maintenance for existing systems.</li>
+                    <li>Participated in team meetings to discuss project status and brainstorm solutions to technical challenges.</li>
+                    <li>Compiled and analyzed data from system tests to improve system performance and reliability.</li>
+                </ul>
+            </div>
+        </section>
+
+        <section class="section" id="education">
+            <h2>Education</h2>
+            <div class="education-card">
+                <h3>MSc: Robotics</h3>
+                <p>Middlesex University Dubai | Currently Pursuing</p>
+                <ul>
+                    <li>Robotics System Science</li>
+                    <li>Intelligent Robotics</li>
+                    <li>Digital Signal Processing</li>
+                    <li>Data Mining with Machine Learning</li>
+                    <li>Control Systems</li>
+                    <li>Mobile Robotics and AI</li>
+                </ul>
+            </div>
+            <div class="education-card">
+                <h3>Bachelor of Technology, Electrical and Electronics Engineering</h3>
+                <p>The University of Bolton UK | 2016 - 2020</p>
+                <ul>
+                    <li>Skills: Electronic Engineering, Artificial Intelligence (AI), Time Management, MATLAB, Electrical Engineering</li>
+                </ul>
+            </div>
+            <div class="education-card">
+                <h3>Foundation Degree, Engineering</h3>
+                <p>Birla Institute Of Technology and Science | Mar 2016 - Jul 2016</p>
+            </div>
+        </section>
+
+        <section class="section" id="skills">
+            <h2>Skills</h2>
+            <ul>
+                <li>Programming: Python, C++, MATLAB, Simulink, Embedded C, SQL, PLC, HMI</li>
+                <li>Software: AutoCAD, SolidWorks, COMSOL, PSPICE, MULTISIM</li>
+                <li>Languages: English, Gujarati, Hindi, Marathi, Norwegian, Arabic</li>
+                <li>Soft Skills: Public Speaking, Project Management, Problem Solving, Sales Marketing</li>
+            </ul>
+        </section>
+
+        <section class="section" id="portfolio">
+            <h2>Portfolio</h2>
+            <div class="portfolio-item">
+                <a href="https://imgur.com/Jyvo23g"><img src="https://i.imgur.com/Jyvo23g.jpg" alt="Line Following Robot" title="Line Following Robot with ROS, Raspberry Pi, and Arduino"></a>
+                <div>
+                    <h3>Line Following Robot with ROS, Raspberry Pi, and Arduino</h3>
+                    <p>Designed and implemented a sophisticated line-following robot using ROS for enhanced sensor integration and motor control.</p>
+                    <ul>
+                        <li>Technology Used: Raspberry Pi, Arduino Uno, IR sensors, ultrasonic sensor, L298N Motor Driver, 2WD Car Kit</li>
+                        <li>Process: Sensor integration, ROS nodes, motor control, decision making, implementation</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="portfolio-item">
+                <a href="https://imgur.com/vCcvy3W"><img src="https://i.imgur.com/vCcvy3W.jpg" alt="Robotic Arm" title="Arduino Based Robotic Arm"></a>
+                <div>
+                    <h3>Arduino Based Robotic Arm</h3>
+                    <p>Constructed a robotic arm to demonstrate advanced automation and precision control.</p>
+                    <ul>
+                        <li>Technology Used: Arduino Board, Servomotors, Sensors, Mechanical Components</li>
+                        <li>Process: Design and build, integration, feedback system, precision control, functional testing</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="portfolio-item">
+                <a href="https://imgur.com/1MqXcUH"><img src="https://i.imgur.com/1MqXcUH.jpg" alt="Smart Home Automation" title="ESP32 Smart Home Automation using Alexa and Google Assistant"></a>
+                <div>
+                    <h3>ESP32 Smart Home Automation using Alexa and Google Assistant</h3>
+                    <p>Created a comprehensive smart home automation system controlled by voice commands using Alexa and Google Assistant.</p>
+                    <ul>
+                        <li>Technology Used: ESP32 WiFi Module</li>
+                        <li>Process: Device connectivity, voice control, system design, testing</li>
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <section class="section" id="certifications">
+            <h2>Licenses & Certifications</h2>
+            <ul>
+                <li>Google and IBM certified Ai and python analyst.</li>
+                <li>Undertook assignment on QHSE practices in the Construction and Automobile industries in Dubai.</li>
+                <li>Member of professional body IEEE and represented the university in seminars.</li>
+                <li>Siemens certified PLC Automation Expert.</li>
+                <li>2nd in International Electrical and Sustainability Innovation competition in UK.</li>
+                <li>Matlab - MathWorks, Issued Jan 2022</li>
+                <li>Microsoft Certified Technology Specialist: Office SharePoint Server 2007, Configuring (MCTS) - Microsoft, Issued May 2021</li>
+                <li>PMMI Mechatronics: Programmable Logic Controllers 1 (PLCs) - Schneider Electric, Issued May 2021</li>
+                <li>Amazon Web Services Security Specialty - Amazon, Issued Mar 2021</li>
+                <li>IBM Certified Advanced Deployment Professional - IBM Service Management Security Intrusion Protection V1 - IBM, Issued Feb 2021</li>
+                <li>Introduction to Programming Using Python - Google, Issued Feb 2021</li>
+                <li>Engineer [Intern] - LTI - Larsen & Toubro Infotech, Issued Feb 2020</li>
+                <li>PMMI Mechatronics: Programmable Logic Controllers 1 (PLCs) - Siemens, Issued Jan 2020</li>
+                <li>Certified Training Professional - Institution of Engineering and Technology (IET), Issued May 2019</li>
+                <li>Advanced Python - Rolla Academy Dubai, Issued Jul 2017</li>
+                <li>Google Cloud Certified Professional Cloud Architect - Google</li>
+            </ul>
+        </section>
+
+        <section class="section" id="volunteer">
+            <h2>Volunteer Experience</h2>
+            <ul>
+                <li>Registration Day at the University of Bolton – 2018</li>
+                <li>IEEE event at the University of Bolton</li>
+                <li>GITEX for Schneider Electric</li>
+                <li>IET at the University of Bolton</li>
+                <li>ADIPEC for Voyage Marine Automation</li>
+                <li>International Automation and AI feast in Dubai</li>
+                <li>Expo 2020 Dubai</li>
+                <li>GCC Technology summit in Dubai</li>
+                <li>Google Developer Students Clubs Member Event in Dubai</li>
+                <li>Wipro Event in Dubai Assistant</li>
+                <li>Robotics & STEM GCC</li>
+            </ul>
+        </section>
+
+        <section class="section" id="contact">
+            <h2>Contact</h2>
+            <p>Feel free to reach out to me through email or phone, or connect with me on LinkedIn.</p>
+        </section>
+    </div>
+
+    <footer class="footer">
+        <p>&copy; 2024 Mahim Trivedi. All rights reserved.</p>
+    </footer>
+
+    <script>
+        // Show back-to-top button when scrolling down
+        var backToTopButton = document.getElementById("back-to-top");
+        window.onscroll = function() {
+            if (document.body.scrollTop > 20 || document.documentElement.scrollTop > 20) {
+                backToTopButton.style.display = "block";
+            } else {
+                backToTopButton.style.display = "none";
+            }
+        };
+    </script>
+</body>
+</html>
+
