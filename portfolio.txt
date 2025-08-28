@@ -8,20 +8,23 @@
     <meta name="keywords" content="Mahim Trivedi, Electrical Engineering, Electronics Engineering, Substation Automation, AI, Market Research, Robotics, Portfolio">
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@400;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap');
         @import url('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css');
         
         body {
-            font-family: 'Roboto', sans-serif;
+            font-family: 'Orbitron', 'Roboto', sans-serif;
             margin: 0;
             padding: 0;
             color: #fff;
-            background: linear-gradient(135deg, #1e1e2f, #252540);
+            background: linear-gradient(135deg, #0b0b22, #1f1f37);
+            background-size: 400% 400%;
+            animation: neonBackground 20s ease infinite;
             scroll-behavior: smooth;
             position: relative;
             overflow-x: hidden;
         }
         .header {
-            background: linear-gradient(135deg, #1e1e2f, #252540);
+            background: linear-gradient(135deg, #1e1e2f, #35355e);
             color: #00bfff;
             text-align: center;
             padding: 2em 0;
@@ -31,6 +34,7 @@
         .header h1 {
             margin: 0;
             font-size: 3em;
+            text-shadow: 0 0 10px #00ffff, 0 0 20px #00ffff;
         }
         .header p {
             margin: 0.5em 0;
@@ -57,6 +61,7 @@
             padding-bottom: 10px;
             margin-bottom: 20px;
             position: relative;
+            text-shadow: 0 0 8px #00bfff;
         }
         .section h2::before {
             content: "";
@@ -125,6 +130,7 @@
         }
         nav a:hover {
             color: #ff80bf;
+            text-shadow: 0 0 8px #ff80bf;
         }
         .portfolio-item {
             display: flex;
@@ -237,6 +243,17 @@
             }
             to {
                 width: 50px;
+            }
+        }
+        @keyframes neonBackground {
+            0% {
+                background-position: 0% 50%;
+            }
+            50% {
+                background-position: 100% 50%;
+            }
+            100% {
+                background-position: 0% 50%;
             }
         }
     </style>
