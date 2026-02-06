@@ -1,0 +1,4 @@
+PyQt6>=6.6
+psutil>=5.9
+pygetwindow>=0.0.9; platform_system == "Windows"
+pyobjc>=10.1; platform_system == "Darwin"
