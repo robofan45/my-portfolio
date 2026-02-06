@@ -1,16 +1,17 @@
 # ResumeFlow
 
-ResumeFlow is a lightweight desktop app that helps you recover context after task switching.
+ResumeFlow is a lightweight, local-first desktop assistant that helps you recover context after task switching.
 
 ## Features
-- Active window focus monitoring:
+- Active window monitoring:
   - Windows: `pygetwindow` + `psutil`
   - macOS: `AppKit` + `psutil`
-- Resume popup when you return to a prior window after an away threshold.
-- "Ready to Resume" micro-task input before dismissing the popup.
-- Daily context switch tracking and score in the system tray.
-- Local SQLite logging for weekly reporting.
-- Adjustable settings for away threshold, popup position, and quiet hours.
+  - Linux: best-effort fallback via `xprop`
+- Resume popup when returning to a previously active window after an away threshold.
+- "Ready to Resume" single-line micro-task field before dismissing the popup.
+- Daily **Context Switch Score** and real-time switch rate in the system tray.
+- Local SQLite logging for weekly reports.
+- Settings for away threshold (30s–5m), popup position, and quiet hours.
 
 ## Run
 ```bash
@@ -22,8 +23,8 @@ python resumeflow.py
 
 ## Data Storage
 - Settings: `~/.resumeflow/settings.json`
-- Events DB: `~/.resumeflow/resumeflow.db`
+- Database: `~/.resumeflow/resumeflow.db`
 
-## Notes
-- No cloud services are used; all data stays local.
-- The app is designed to be lightweight and polls once per second.
+## Privacy
+- No cloud calls.
+- All data is stored locally.

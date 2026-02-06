@@ -1,18 +1,21 @@
+from __future__ import annotations
+
 import dataclasses
 import datetime as dt
 import json
-import os
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import psutil
-from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt6.QtGui import QAction, QCursor, QIcon, QPainter, QColor
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal, QTime
+from PyQt6.QtGui import QAction, QColor, QCursor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFormLayout,
     QHBoxLayout,
@@ -26,7 +29,6 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 
 APP_NAME = "ResumeFlow"
 CONFIG_DIR = Path.home() / ".resumeflow"
@@ -42,7 +44,7 @@ class WindowSnapshot:
 
     @property
     def window_key(self) -> str:
-        return f"{self.app_name}::{self.title}"
+        return f"{self.app_name}::{self.title}".strip()
 
 
 @dataclass
@@ -55,12 +57,20 @@ class Settings:
     @classmethod
     def load(cls) -> "Settings":
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        if CONFIG_PATH.exists():
-            with CONFIG_PATH.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return cls(**{**dataclasses.asdict(cls()), **data})
-        settings = cls()
-        settings.save()
+        if not CONFIG_PATH.exists():
+            settings = cls()
+            settings.save()
+            return settings
+
+        with CONFIG_PATH.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+
+        defaults = dataclasses.asdict(cls())
+        defaults.update(raw if isinstance(raw, dict) else {})
+        settings = cls(**defaults)
+        settings.away_threshold_seconds = max(30, min(300, int(settings.away_threshold_seconds)))
+        if settings.popup_position not in {"near_cursor", "top_right", "bottom_right"}:
+            settings.popup_position = "near_cursor"
         return settings
 
     def save(self) -> None:
@@ -125,19 +135,31 @@ class SwitchDatabase:
         return int(cur.fetchone()[0])
 
     def switches_per_hour_for_day(self, day: dt.date) -> float:
+        now = dt.datetime.now()
         start = dt.datetime.combine(day, dt.time.min)
         end = dt.datetime.combine(day, dt.time.max)
         cur = self.conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM switches
-            WHERE switched_at BETWEEN ? AND ?
-            """,
+            "SELECT COUNT(*) FROM switches WHERE switched_at BETWEEN ? AND ?",
             (start.isoformat(), end.isoformat()),
         )
         total = int(cur.fetchone()[0])
-        active_hours = max((dt.datetime.now() - start).total_seconds() / 3600.0, 1.0)
-        return total / active_hours
+        elapsed_hours = max((now - start).total_seconds() / 3600.0, 1.0)
+        return total / elapsed_hours
+
+    def weekly_report(self) -> list[tuple[str, int]]:
+        now = dt.datetime.now()
+        start = (now - dt.timedelta(days=6)).replace(hour=0, minute=0, second=0, microsecond=0)
+        cur = self.conn.execute(
+            """
+            SELECT substr(switched_at, 1, 10) AS day, COUNT(*)
+            FROM switches
+            WHERE switched_at >= ?
+            GROUP BY day
+            ORDER BY day
+            """,
+            (start.isoformat(),),
+        )
+        return [(str(day), int(count)) for day, count in cur.fetchall()]
 
 
 class ActiveWindowProvider:
@@ -148,14 +170,18 @@ class ActiveWindowProvider:
             return ActiveWindowProvider._current_window_windows(now)
         if sys.platform == "darwin":
             return ActiveWindowProvider._current_window_mac(now)
+        if sys.platform.startswith("linux"):
+            return ActiveWindowProvider._current_window_linux(now)
         return None
 
     @staticmethod
     def _current_window_windows(now: dt.datetime) -> Optional[WindowSnapshot]:
         try:
             import pygetwindow as gw
+            import ctypes
         except Exception:
             return None
+
         try:
             window = gw.getActiveWindow()
             if not window or not window.title:
@@ -163,12 +189,10 @@ class ActiveWindowProvider:
             app_name = "Unknown"
             hwnd = getattr(window, "_hWnd", None)
             if hwnd:
-                import ctypes
-
                 pid = ctypes.c_ulong()
                 ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
                 app_name = psutil.Process(pid.value).name()
-            return WindowSnapshot(title=window.title, app_name=app_name, observed_at=now)
+            return WindowSnapshot(title=window.title.strip(), app_name=app_name.strip(), observed_at=now)
         except Exception:
             return None
 
@@ -178,18 +202,36 @@ class ActiveWindowProvider:
             from AppKit import NSWorkspace
         except Exception:
             return None
-        app = NSWorkspace.sharedWorkspace().frontmostApplication()
-        if not app:
-            return None
-        app_name = app.localizedName() or "Unknown"
-        pid = app.processIdentifier()
-        title = app_name
+
         try:
-            proc = psutil.Process(pid)
-            title = f"{app_name} ({proc.name()})"
+            app = NSWorkspace.sharedWorkspace().frontmostApplication()
+            if not app:
+                return None
+            app_name = app.localizedName() or "Unknown"
+            pid = app.processIdentifier()
+            title = app_name
+            try:
+                proc = psutil.Process(pid)
+                title = f"{app_name} - {proc.name()}"
+            except Exception:
+                pass
+            return WindowSnapshot(title=title.strip(), app_name=app_name.strip(), observed_at=now)
         except Exception:
-            pass
-        return WindowSnapshot(title=title, app_name=app_name, observed_at=now)
+            return None
+
+    @staticmethod
+    def _current_window_linux(now: dt.datetime) -> Optional[WindowSnapshot]:
+        # Best-effort fallback for development environments.
+        try:
+            win_id = subprocess.check_output(["xprop", "-root", "_NET_ACTIVE_WINDOW"], text=True)
+            win_id = win_id.strip().split()[-1]
+            if win_id == "0x0":
+                return None
+            title_out = subprocess.check_output(["xprop", "-id", win_id, "WM_NAME"], text=True)
+            title = title_out.split("=", 1)[-1].strip().strip('"')
+            return WindowSnapshot(title=title or "Unknown", app_name="LinuxApp", observed_at=now)
+        except Exception:
+            return None
 
 
 class FloatingResumePopup(QWidget):
@@ -198,43 +240,23 @@ class FloatingResumePopup(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowFlags(
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         card = QWidget()
         card.setStyleSheet(
             """
-            QWidget {
-                background: #202124;
-                color: #f5f6f7;
-                border: 1px solid #3b3f44;
-                border-radius: 8px;
-                font-size: 12px;
-            }
-            QLineEdit {
-                background: #111316;
-                border: 1px solid #3b3f44;
-                border-radius: 4px;
-                padding: 4px;
-                color: #f5f6f7;
-            }
-            QPushButton {
-                background: #2663eb;
-                border: none;
-                border-radius: 4px;
-                color: white;
-                padding: 4px 8px;
-            }
+            QWidget { background: #202124; color: #f5f6f7; border: 1px solid #3b3f44; border-radius: 8px; font-size: 12px; }
+            QLineEdit { background: #111316; border: 1px solid #3b3f44; border-radius: 4px; padding: 4px; color: #f5f6f7; }
+            QPushButton { background: #2663eb; border: none; border-radius: 4px; color: white; padding: 4px 8px; }
             """
         )
 
         self.message_label = QLabel()
         self.message_label.setWordWrap(True)
         self.checklist_input = QLineEdit()
-        self.checklist_input.setPlaceholderText("Ready to Resume: next micro-task")
+        self.checklist_input.setPlaceholderText("Ready to Resume: type your next micro-task")
         dismiss_btn = QPushButton("Dismiss")
         dismiss_btn.clicked.connect(self._on_submit)
 
@@ -251,18 +273,18 @@ class FloatingResumePopup(QWidget):
         self.message_label.setText(text)
         self.checklist_input.clear()
         self.adjustSize()
-        cursor_pos = QCursor.pos()
+
+        cursor = QCursor.pos()
+        screen = QApplication.primaryScreen().availableGeometry()
         if position == "top_right":
-            geom = QApplication.primaryScreen().availableGeometry()
-            self.move(geom.right() - self.width() - 20, geom.top() + 20)
+            self.move(screen.right() - self.width() - 20, screen.top() + 20)
         elif position == "bottom_right":
-            geom = QApplication.primaryScreen().availableGeometry()
-            self.move(geom.right() - self.width() - 20, geom.bottom() - self.height() - 20)
+            self.move(screen.right() - self.width() - 20, screen.bottom() - self.height() - 20)
         else:
-            self.move(cursor_pos.x() + 12, cursor_pos.y() + 12)
+            self.move(cursor.x() + 12, cursor.y() + 12)
+
         self.show()
         self.raise_()
-        self.activateWindow()
 
     def _on_submit(self):
         self.submitted.emit(self.checklist_input.text().strip())
@@ -280,27 +302,29 @@ class SettingsDialog(QDialog):
         self.threshold.setValue(settings.away_threshold_seconds)
         self.threshold.setSuffix(" sec")
 
-        self.position = QLineEdit(settings.popup_position)
-        self.position.setPlaceholderText("near_cursor | top_right | bottom_right")
+        self.position = QComboBox()
+        self.position.addItems(["near_cursor", "top_right", "bottom_right"])
+        self.position.setCurrentText(settings.popup_position)
 
         self.quiet_start = QTimeEdit()
         self.quiet_start.setDisplayFormat("HH:mm")
-        self.quiet_start.setTime(dt.datetime.strptime(settings.quiet_start, "%H:%M").time())
+        self.quiet_start.setTime(QTime.fromString(settings.quiet_start, "HH:mm"))
 
         self.quiet_end = QTimeEdit()
         self.quiet_end.setDisplayFormat("HH:mm")
-        self.quiet_end.setTime(dt.datetime.strptime(settings.quiet_end, "%H:%M").time())
+        self.quiet_end.setTime(QTime.fromString(settings.quiet_end, "HH:mm"))
 
         form = QFormLayout()
-        form.addRow("Away Threshold", self.threshold)
-        form.addRow("Popup Position", self.position)
-        form.addRow("Quiet Hours Start", self.quiet_start)
-        form.addRow("Quiet Hours End", self.quiet_end)
+        form.addRow("Away threshold", self.threshold)
+        form.addRow("Popup position", self.position)
+        form.addRow("Quiet hours start", self.quiet_start)
+        form.addRow("Quiet hours end", self.quiet_end)
 
         save_btn = QPushButton("Save")
         save_btn.clicked.connect(self.accept)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
+
         buttons = QHBoxLayout()
         buttons.addStretch()
         buttons.addWidget(cancel_btn)
@@ -312,14 +336,14 @@ class SettingsDialog(QDialog):
 
     def apply(self):
         self.settings.away_threshold_seconds = int(self.threshold.value())
-        self.settings.popup_position = self.position.text().strip() or "near_cursor"
+        self.settings.popup_position = self.position.currentText()
         self.settings.quiet_start = self.quiet_start.time().toString("HH:mm")
         self.settings.quiet_end = self.quiet_end.time().toString("HH:mm")
         self.settings.save()
 
 
 class MonitorThread(QThread):
-    switched = pyqtSignal(object, object, float)
+    switched = pyqtSignal(object, object)
 
     def __init__(self):
         super().__init__()
@@ -330,8 +354,7 @@ class MonitorThread(QThread):
         while self.running:
             current = ActiveWindowProvider.current_window()
             if current and self.previous and current.window_key != self.previous.window_key:
-                away = (current.observed_at - self.previous.observed_at).total_seconds()
-                self.switched.emit(self.previous, current, away)
+                self.switched.emit(self.previous, current)
             if current:
                 self.previous = current
             self.msleep(1000)
@@ -344,34 +367,41 @@ class ResumeFlowApp:
     def __init__(self):
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
+
         self.settings = Settings.load()
         self.db = SwitchDatabase(DB_PATH)
         self.popup = FloatingResumePopup()
         self.popup.submitted.connect(self.on_popup_submitted)
+
         self.pending_resume_context: Optional[tuple[WindowSnapshot, float]] = None
-
-        self.last_seen: dict[str, WindowSnapshot] = {}
+        self.last_seen_by_window: dict[str, WindowSnapshot] = {}
         self.switches_today = self.db.switch_count_for_day(dt.date.today())
+        self.last_switch_from: Optional[WindowSnapshot] = None
 
-        self.tray = QSystemTrayIcon()
-        self.tray.setIcon(self._build_icon())
-        self.tray.setToolTip(f"{APP_NAME}: {self.switches_today} switches today")
-        menu = QMenu()
-        score_action = QAction("Context Switch Score: --")
-        score_action.setEnabled(False)
-        self.score_action = score_action
-        menu.addAction(score_action)
-        menu.addSeparator()
+        self.tray = QSystemTrayIcon(self._build_icon())
+        self.menu = QMenu()
+        self.score_action = QAction("Context Switch Score: --")
+        self.score_action.setEnabled(False)
+        self.switches_action = QAction("Switches this hour: --")
+        self.switches_action.setEnabled(False)
+
+        self.menu.addAction(self.score_action)
+        self.menu.addAction(self.switches_action)
+        self.menu.addSeparator()
+
+        weekly_action = QAction("Show weekly report")
+        weekly_action.triggered.connect(self.show_weekly_report)
+        self.menu.addAction(weekly_action)
 
         settings_action = QAction("Settings")
         settings_action.triggered.connect(self.open_settings)
-        menu.addAction(settings_action)
+        self.menu.addAction(settings_action)
 
         quit_action = QAction("Quit")
         quit_action.triggered.connect(self.quit)
-        menu.addAction(quit_action)
+        self.menu.addAction(quit_action)
 
-        self.tray.setContextMenu(menu)
+        self.tray.setContextMenu(self.menu)
         self.tray.show()
 
         self.monitor = MonitorThread()
@@ -384,14 +414,12 @@ class ResumeFlowApp:
         self.refresh_score()
 
     def _build_icon(self) -> QIcon:
-        from PyQt6.QtGui import QPixmap
-
         pix = QPixmap(64, 64)
         pix.fill(QColor("#1b1f24"))
-        p = QPainter(pix)
-        p.setPen(QColor("#5bc0ff"))
-        p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "RF")
-        p.end()
+        painter = QPainter(pix)
+        painter.setPen(QColor("#5bc0ff"))
+        painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "RF")
+        painter.end()
         return QIcon(pix)
 
     def is_quiet_hours(self) -> bool:
@@ -402,31 +430,37 @@ class ResumeFlowApp:
             return start <= now <= end
         return now >= start or now <= end
 
-    def on_switch(self, from_snapshot: WindowSnapshot, to_snapshot: WindowSnapshot, away_seconds: float):
-        self.db.log_switch(dt.datetime.now(), from_snapshot, to_snapshot, away_seconds)
-        self.switches_today += 1
-        self.last_seen[from_snapshot.window_key] = from_snapshot
+    def on_switch(self, from_snapshot: WindowSnapshot, to_snapshot: WindowSnapshot):
+        now = dt.datetime.now()
+        away_seconds = 0.0
 
-        previous_seen = self.last_seen.get(to_snapshot.window_key)
+        previous_seen = self.last_seen_by_window.get(to_snapshot.window_key)
         if previous_seen:
-            elapsed = (to_snapshot.observed_at - previous_seen.observed_at).total_seconds()
-            if elapsed >= self.settings.away_threshold_seconds and not self.is_quiet_hours():
-                mins = int(elapsed // 60)
-                msg = (
-                    f"You were last here {mins} minute(s) ago. "
-                    f"You were working on: {to_snapshot.title}"
-                )
-                self.pending_resume_context = (to_snapshot, elapsed)
-                self.popup.show_message(msg, self.settings.popup_position)
+            away_seconds = (to_snapshot.observed_at - previous_seen.observed_at).total_seconds()
 
-        self.last_seen[to_snapshot.window_key] = to_snapshot
+        self.db.log_switch(now, from_snapshot, to_snapshot, away_seconds)
+        self.switches_today += 1
+        self.last_switch_from = from_snapshot
+        self.last_seen_by_window[from_snapshot.window_key] = from_snapshot
+        self.last_seen_by_window[to_snapshot.window_key] = to_snapshot
+
+        if previous_seen and away_seconds >= self.settings.away_threshold_seconds and not self.is_quiet_hours():
+            minutes = max(1, int(away_seconds // 60))
+            context = previous_seen.title or to_snapshot.title
+            message = (
+                f"You were last here {minutes} minute(s) ago. "
+                f"You were working on: {context}"
+            )
+            self.pending_resume_context = (to_snapshot, away_seconds)
+            self.popup.show_message(message, self.settings.popup_position)
+
         self.refresh_score()
 
     def on_popup_submitted(self, note: str):
         if not self.pending_resume_context:
             return
         snapshot, elapsed = self.pending_resume_context
-        self.db.log_switch(dt.datetime.now(), snapshot, snapshot, elapsed, note)
+        self.db.log_switch(dt.datetime.now(), self.last_switch_from, snapshot, elapsed, note)
         self.pending_resume_context = None
 
     def refresh_score(self):
@@ -434,7 +468,16 @@ class ResumeFlowApp:
         per_hour = self.db.switches_per_hour_for_day(day)
         score = min(int(per_hour * 10), 100)
         self.score_action.setText(f"Context Switch Score: {score}/100")
+        self.switches_action.setText(f"Switches this hour: {per_hour:.1f}")
         self.tray.setToolTip(f"{APP_NAME}: {self.switches_today} switches today | Score {score}")
+
+    def show_weekly_report(self):
+        report = self.db.weekly_report()
+        if not report:
+            self.tray.showMessage(APP_NAME, "No weekly switch data yet.", QSystemTrayIcon.MessageIcon.Information)
+            return
+        lines = [f"{day}: {count}" for day, count in report]
+        self.tray.showMessage(APP_NAME, "Weekly context switches\n" + "\n".join(lines), QSystemTrayIcon.MessageIcon.Information)
 
     def open_settings(self):
         dialog = SettingsDialog(self.settings)
@@ -447,13 +490,13 @@ class ResumeFlowApp:
         self.tray.hide()
         self.app.quit()
 
-    def run(self):
+    def run(self) -> int:
         return self.app.exec()
 
 
 def main():
     app = ResumeFlowApp()
-    sys.exit(app.run())
+    raise SystemExit(app.run())
 
 
 if __name__ == "__main__":
