@@ -61,6 +61,9 @@ NOISE_SWITCH_SECONDS = 2.0
 WATCHDOG_INTERVAL = 0.5
 WATCHDOG_REFRESH_MS = 5000
 ACTIVE_FALLBACK_POLL_MS = 1200
+MAX_POPUP_AWAY_SECONDS = 8 * 60 * 60
+OFFSET_MIN = -500
+OFFSET_MAX = 500
 
 LOGGER = logging.getLogger(APP_NAME)
 
@@ -82,6 +85,15 @@ def parse_hhmm(value: str, fallback: str) -> dtime:
         return datetime.strptime(value, "%H:%M").time()
     except Exception:
         return datetime.strptime(fallback, "%H:%M").time()
+
+
+def is_within_quiet_hours(current: dtime, start: dtime, end: dtime) -> bool:
+    """Return True when current is inside quiet hours window."""
+    if start == end:
+        return False
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
 
 
 class DatabaseManager:
@@ -135,8 +147,8 @@ class DatabaseManager:
             MIN_THRESHOLD,
             min(MAX_THRESHOLD, self._safe_int(kv.get("away_threshold_sec"), base.away_threshold_sec)),
         )
-        base.popup_offset_x = self._safe_int(kv.get("popup_offset_x"), base.popup_offset_x)
-        base.popup_offset_y = self._safe_int(kv.get("popup_offset_y"), base.popup_offset_y)
+        base.popup_offset_x = max(OFFSET_MIN, min(OFFSET_MAX, self._safe_int(kv.get("popup_offset_x"), base.popup_offset_x)))
+        base.popup_offset_y = max(OFFSET_MIN, min(OFFSET_MAX, self._safe_int(kv.get("popup_offset_y"), base.popup_offset_y)))
         base.quiet_start = kv.get("quiet_start", base.quiet_start)
         base.quiet_end = kv.get("quiet_end", base.quiet_end)
         base.popup_auto_dismiss_on_focus_loss = kv.get("popup_auto_dismiss_on_focus_loss", "0") == "1"
@@ -146,8 +158,8 @@ class DatabaseManager:
     def save_settings(self, settings: AppSettings) -> None:
         values = {
             "away_threshold_sec": str(settings.away_threshold_sec),
-            "popup_offset_x": str(settings.popup_offset_x),
-            "popup_offset_y": str(settings.popup_offset_y),
+            "popup_offset_x": str(max(OFFSET_MIN, min(OFFSET_MAX, settings.popup_offset_x))),
+            "popup_offset_y": str(max(OFFSET_MIN, min(OFFSET_MAX, settings.popup_offset_y))),
             "quiet_start": settings.quiet_start,
             "quiet_end": settings.quiet_end,
             "popup_auto_dismiss_on_focus_loss": "1" if settings.popup_auto_dismiss_on_focus_loss else "0",
@@ -340,11 +352,11 @@ class SettingsDialog(QDialog):
         self.threshold.setValue(settings.away_threshold_sec)
 
         self.offset_x = QSpinBox()
-        self.offset_x.setRange(-500, 500)
+        self.offset_x.setRange(OFFSET_MIN, OFFSET_MAX)
         self.offset_x.setValue(settings.popup_offset_x)
 
         self.offset_y = QSpinBox()
-        self.offset_y.setRange(-500, 500)
+        self.offset_y.setRange(OFFSET_MIN, OFFSET_MAX)
         self.offset_y.setValue(settings.popup_offset_y)
 
         self.quiet_start = QTimeEdit()
@@ -615,6 +627,9 @@ class TrayController(QObject):
         self.action_open_data = QAction("Open Data Folder", self.menu)
         self.action_open_data.triggered.connect(self.open_data_folder)
 
+        self.action_open_logs = QAction("Open Log File", self.menu)
+        self.action_open_logs.triggered.connect(self.open_log_file)
+
         self.action_score = QAction("Context Switch Score: 0", self.menu)
         self.action_score.setEnabled(False)
 
@@ -625,6 +640,7 @@ class TrayController(QObject):
         self.menu.addAction(self.action_settings)
         self.menu.addAction(self.action_report)
         self.menu.addAction(self.action_open_data)
+        self.menu.addAction(self.action_open_logs)
         self.menu.addAction(self.action_score)
         self.menu.addSeparator()
         self.menu.addAction(self.action_quit)
@@ -643,6 +659,8 @@ class TrayController(QObject):
         self.settings.pause_tracking = checked
         self.db.save_settings(self.settings)
         self.update_status()
+        state_msg = "Tracking paused" if checked else "Tracking resumed"
+        self.tray.showMessage(APP_NAME, state_msg, QSystemTrayIcon.MessageIcon.Information, 1500)
 
     def _on_switch(self, event: dict[str, Any]) -> None:
         if self.settings.pause_tracking:
@@ -670,7 +688,10 @@ class TrayController(QObject):
         away_start = self.last_left_at.get(new_key)
         if away_start is not None:
             away_seconds = (ts - away_start).total_seconds()
-            if away_seconds >= self.settings.away_threshold_sec and not self._is_in_quiet_hours(ts.time()):
+            if (
+                self.settings.away_threshold_sec <= away_seconds <= MAX_POPUP_AWAY_SECONDS
+                and not self._is_in_quiet_hours(ts.time())
+            ):
                 cursor = QCursor.pos()
                 popup_pos = self._safe_popup_pos(
                     cursor.x() + self.settings.popup_offset_x,
@@ -690,11 +711,7 @@ class TrayController(QObject):
     def _is_in_quiet_hours(self, current: dtime) -> bool:
         start = parse_hhmm(self.settings.quiet_start, "22:00")
         end = parse_hhmm(self.settings.quiet_end, "07:00")
-        if start == end:
-            return False
-        if start < end:
-            return start <= current < end
-        return current >= start or current < end
+        return is_within_quiet_hours(current, start, end)
 
     def _safe_popup_pos(self, x: int, y: int) -> QPoint:
         """Clamp popup position to the available screen to avoid off-screen windows."""
@@ -777,13 +794,19 @@ class TrayController(QObject):
         if not path:
             return
 
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["timestamp", "previous_window_title", "new_window_title", "micro_task"])
-            for row in rows:
-                writer.writerow([row["timestamp"], row["previous_window_title"], row["new_window_title"], row["micro_task"]])
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(["timestamp", "previous_window_title", "new_window_title", "micro_task"])
+                for row in rows:
+                    writer.writerow([row["timestamp"], row["previous_window_title"], row["new_window_title"], row["micro_task"]])
+        except Exception as exc:
+            LOGGER.exception("Failed to export CSV")
+            QMessageBox.critical(None, APP_NAME, f"Failed to export report:\n{exc}")
+            return
 
         QMessageBox.information(None, "ResumeFlow", f"Report exported:\n{path}")
+        self.tray.showMessage(APP_NAME, "CSV report exported", QSystemTrayIcon.MessageIcon.Information, 2000)
 
     def open_data_folder(self) -> None:
         if not APP_DIR.exists():
@@ -792,6 +815,14 @@ class TrayController(QObject):
         from PyQt6.QtCore import QUrl
 
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DIR)))
+
+    def open_log_file(self) -> None:
+        if not LOG_PATH.exists():
+            LOG_PATH.touch(exist_ok=True)
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_PATH)))
 
     def quit(self) -> None:
         self.tracker.stop()
