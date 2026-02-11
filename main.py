@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
@@ -74,6 +74,14 @@ class AppSettings:
     quiet_end: str = "07:00"
     popup_auto_dismiss_on_focus_loss: bool = False
     pause_tracking: bool = False
+
+
+def parse_hhmm(value: str, fallback: str) -> dtime:
+    """Parse HH:MM safely and fall back on invalid persisted values."""
+    try:
+        return datetime.strptime(value, "%H:%M").time()
+    except Exception:
+        return datetime.strptime(fallback, "%H:%M").time()
 
 
 class DatabaseManager:
@@ -208,7 +216,7 @@ class DatabaseManager:
     def reset_switches(self) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM switches")
-            self.conn.execute("VACUUM")
+        self.conn.execute("VACUUM")
 
     @staticmethod
     def _safe_int(v: str | None, fallback: int) -> int:
@@ -341,11 +349,11 @@ class SettingsDialog(QDialog):
 
         self.quiet_start = QTimeEdit()
         self.quiet_start.setDisplayFormat("HH:mm")
-        self.quiet_start.setTime(datetime.strptime(settings.quiet_start, "%H:%M").time())
+        self.quiet_start.setTime(parse_hhmm(settings.quiet_start, "22:00"))
 
         self.quiet_end = QTimeEdit()
         self.quiet_end.setDisplayFormat("HH:mm")
-        self.quiet_end.setTime(datetime.strptime(settings.quiet_end, "%H:%M").time())
+        self.quiet_end.setTime(parse_hhmm(settings.quiet_end, "07:00"))
 
         self.auto_dismiss = QCheckBox("Auto-dismiss popup on focus loss")
         self.auto_dismiss.setChecked(settings.popup_auto_dismiss_on_focus_loss)
@@ -385,7 +393,7 @@ class SettingsDialog(QDialog):
 
 
 class TodayReportDialog(QDialog):
-    def __init__(self, rows: list[sqlite3.Row], total: int, on_export: callable):
+    def __init__(self, rows: list[sqlite3.Row], total: int, on_export: Callable[[], None]):
         super().__init__()
         self._on_export = on_export
         self.setWindowTitle("Today's Report")
@@ -604,6 +612,9 @@ class TrayController(QObject):
         self.action_report = QAction("View Today's Report", self.menu)
         self.action_report.triggered.connect(self.open_report)
 
+        self.action_open_data = QAction("Open Data Folder", self.menu)
+        self.action_open_data.triggered.connect(self.open_data_folder)
+
         self.action_score = QAction("Context Switch Score: 0", self.menu)
         self.action_score.setEnabled(False)
 
@@ -613,6 +624,7 @@ class TrayController(QObject):
         self.menu.addAction(self.action_pause)
         self.menu.addAction(self.action_settings)
         self.menu.addAction(self.action_report)
+        self.menu.addAction(self.action_open_data)
         self.menu.addAction(self.action_score)
         self.menu.addSeparator()
         self.menu.addAction(self.action_quit)
@@ -660,7 +672,7 @@ class TrayController(QObject):
             away_seconds = (ts - away_start).total_seconds()
             if away_seconds >= self.settings.away_threshold_sec and not self._is_in_quiet_hours(ts.time()):
                 cursor = QCursor.pos()
-                popup_pos = QPoint(
+                popup_pos = self._safe_popup_pos(
                     cursor.x() + self.settings.popup_offset_x,
                     cursor.y() + self.settings.popup_offset_y,
                 )
@@ -676,13 +688,26 @@ class TrayController(QObject):
         return self.last_switch_pair == (new_key, prev_key)
 
     def _is_in_quiet_hours(self, current: dtime) -> bool:
-        start = datetime.strptime(self.settings.quiet_start, "%H:%M").time()
-        end = datetime.strptime(self.settings.quiet_end, "%H:%M").time()
+        start = parse_hhmm(self.settings.quiet_start, "22:00")
+        end = parse_hhmm(self.settings.quiet_end, "07:00")
         if start == end:
             return False
         if start < end:
             return start <= current < end
         return current >= start or current < end
+
+    def _safe_popup_pos(self, x: int, y: int) -> QPoint:
+        """Clamp popup position to the available screen to avoid off-screen windows."""
+        screen = QApplication.screenAt(QPoint(x, y)) or QApplication.primaryScreen()
+        if screen is None:
+            return QPoint(x, y)
+
+        geo = screen.availableGeometry()
+        width = max(self.popup.width(), 280)
+        height = max(self.popup.height(), 140)
+        clamped_x = max(geo.left(), min(x, geo.right() - width))
+        clamped_y = max(geo.top(), min(y, geo.bottom() - height))
+        return QPoint(clamped_x, clamped_y)
 
     def _on_popup_submit(self, switch_id: int, text: str) -> None:
         if text.strip():
@@ -759,6 +784,14 @@ class TrayController(QObject):
                 writer.writerow([row["timestamp"], row["previous_window_title"], row["new_window_title"], row["micro_task"]])
 
         QMessageBox.information(None, "ResumeFlow", f"Report exported:\n{path}")
+
+    def open_data_folder(self) -> None:
+        if not APP_DIR.exists():
+            APP_DIR.mkdir(parents=True, exist_ok=True)
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DIR)))
 
     def quit(self) -> None:
         self.tracker.stop()
