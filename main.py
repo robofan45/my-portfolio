@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
-"""ResumeFlow - local desktop context-switch coach and logger."""
+"""ResumeFlow - production-ready local desktop context switch tracker.
+
+Install dependencies:
+    pip install pyqt6 pywinctl psutil
+"""
 
 from __future__ import annotations
 
+import csv
+import logging
 import sqlite3
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QObject, QPoint, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
@@ -26,13 +35,11 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
-    QStyle,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTimeEdit,
     QVBoxLayout,
-    QWidget,
 )
 
 try:
@@ -42,12 +49,20 @@ except Exception:  # optional dependency
 
 import pywinctl
 
-
 APP_NAME = "ResumeFlow"
-DB_PATH = Path(__file__).resolve().parent / "resumeflow.db"
+APP_DIR = Path.home() / ".resumeflow"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = APP_DIR / "resumeflow.db"
+LOG_PATH = APP_DIR / "resumeflow.log"
+
 MIN_THRESHOLD = 30
 MAX_THRESHOLD = 300
 NOISE_SWITCH_SECONDS = 2.0
+WATCHDOG_INTERVAL = 0.5
+WATCHDOG_REFRESH_MS = 5000
+ACTIVE_FALLBACK_POLL_MS = 1200
+
+LOGGER = logging.getLogger(APP_NAME)
 
 
 @dataclass
@@ -58,15 +73,24 @@ class AppSettings:
     quiet_start: str = "22:00"
     quiet_end: str = "07:00"
     popup_auto_dismiss_on_focus_loss: bool = False
+    pause_tracking: bool = False
 
 
 class DatabaseManager:
     def __init__(self, db_path: Path):
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
-        self._init_schema()
+        self._configure_connection()
+        self._migrate()
 
-    def _init_schema(self) -> None:
+    def _configure_connection(self) -> None:
+        with self.conn:
+            self.conn.execute("PRAGMA journal_mode = WAL")
+            self.conn.execute("PRAGMA synchronous = NORMAL")
+            self.conn.execute("PRAGMA temp_store = MEMORY")
+            self.conn.execute("PRAGMA foreign_keys = ON")
+
+    def _migrate(self) -> None:
         with self.conn:
             self.conn.execute(
                 """
@@ -87,6 +111,12 @@ class DatabaseManager:
                 )
                 """
             )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_switches_timestamp ON switches(timestamp)"
+            )
+
+    def close(self) -> None:
+        self.conn.close()
 
     def load_settings(self) -> AppSettings:
         base = AppSettings()
@@ -102,6 +132,7 @@ class DatabaseManager:
         base.quiet_start = kv.get("quiet_start", base.quiet_start)
         base.quiet_end = kv.get("quiet_end", base.quiet_end)
         base.popup_auto_dismiss_on_focus_loss = kv.get("popup_auto_dismiss_on_focus_loss", "0") == "1"
+        base.pause_tracking = kv.get("pause_tracking", "0") == "1"
         return base
 
     def save_settings(self, settings: AppSettings) -> None:
@@ -112,6 +143,7 @@ class DatabaseManager:
             "quiet_start": settings.quiet_start,
             "quiet_end": settings.quiet_end,
             "popup_auto_dismiss_on_focus_loss": "1" if settings.popup_auto_dismiss_on_focus_loss else "0",
+            "pause_tracking": "1" if settings.pause_tracking else "0",
         }
         with self.conn:
             for k, v in values.items():
@@ -158,7 +190,7 @@ class DatabaseManager:
         ).fetchone()
         return int(row["c"]) if row else 0
 
-    def get_today_rows(self, limit: int = 50) -> list[sqlite3.Row]:
+    def get_today_rows(self, limit: int = 100) -> list[sqlite3.Row]:
         day = datetime.now()
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
@@ -176,6 +208,7 @@ class DatabaseManager:
     def reset_switches(self) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM switches")
+            self.conn.execute("VACUUM")
 
     @staticmethod
     def _safe_int(v: str | None, fallback: int) -> int:
@@ -196,62 +229,58 @@ class ResumePopup(QFrame):
         self._auto_dismiss = False
         self._switch_id: int | None = None
 
-        container = QFrame(self)
-        container.setObjectName("PopupCard")
-        container.setStyleSheet(
+        card = QFrame(self)
+        card.setObjectName("PopupCard")
+        card.setStyleSheet(
             """
             #PopupCard {
-                background: rgba(31, 35, 42, 235);
-                border: 1px solid rgba(255,255,255,40);
+                background: rgba(22, 26, 30, 240);
+                border: 1px solid rgba(255,255,255,38);
                 border-radius: 12px;
             }
-            QLabel {
-                color: #f1f3f5;
-            }
+            QLabel { color: #f5f7fa; }
             QLineEdit {
                 color: #f8f9fa;
-                background: rgba(255,255,255,20);
-                border: 1px solid rgba(255,255,255,35);
+                background: rgba(255,255,255,22);
+                border: 1px solid rgba(255,255,255,36);
                 border-radius: 8px;
                 padding: 6px 8px;
             }
             QPushButton {
-                background: #5c7cfa;
+                background: #3b82f6;
                 border-radius: 8px;
                 color: white;
-                padding: 6px 16px;
+                padding: 6px 14px;
             }
-            QPushButton:hover {
-                background: #748ffc;
-            }
+            QPushButton:hover { background: #60a5fa; }
             """
         )
 
-        self.info_label = QLabel("")
+        self.info_label = QLabel()
         self.info_label.setWordWrap(True)
-        self.work_label = QLabel("")
+        self.work_label = QLabel()
         self.work_label.setWordWrap(True)
 
-        label = QLabel("Next micro-task (optional):")
+        text_label = QLabel("Next micro-task (optional):")
         self.task_input = QLineEdit()
-        self.task_input.setPlaceholderText("e.g., Fix heading spacing")
+        self.task_input.setPlaceholderText("e.g., Finalize section intro")
         self.task_input.returnPressed.connect(self._submit)
 
-        ok = QPushButton("OK")
-        ok.clicked.connect(self._submit)
+        ok_btn = QPushButton("OK")
+        ok_btn.clicked.connect(self._submit)
 
-        card_layout = QVBoxLayout(container)
+        card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(14, 12, 14, 12)
         card_layout.setSpacing(8)
         card_layout.addWidget(self.info_label)
         card_layout.addWidget(self.work_label)
-        card_layout.addWidget(label)
+        card_layout.addWidget(text_label)
         card_layout.addWidget(self.task_input)
-        card_layout.addWidget(ok, alignment=Qt.AlignmentFlag.AlignRight)
+        card_layout.addWidget(ok_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(container)
+        root.addWidget(card)
 
     def configure(self, auto_dismiss: bool) -> None:
         self._auto_dismiss = auto_dismiss
@@ -283,8 +312,8 @@ class ResumePopup(QFrame):
         s = int(max(0, seconds))
         if s >= 60:
             mins = s // 60
-            sec = s % 60
-            return f"{mins}m {sec}s" if sec else f"{mins}m"
+            rem = s % 60
+            return f"{mins}m {rem}s" if rem else f"{mins}m"
         return f"{s}s"
 
 
@@ -295,7 +324,7 @@ class SettingsDialog(QDialog):
     def __init__(self, settings: AppSettings):
         super().__init__()
         self.setWindowTitle("ResumeFlow Settings")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(430)
 
         self.threshold = QSpinBox()
         self.threshold.setRange(MIN_THRESHOLD, MAX_THRESHOLD)
@@ -310,16 +339,13 @@ class SettingsDialog(QDialog):
         self.offset_y.setRange(-500, 500)
         self.offset_y.setValue(settings.popup_offset_y)
 
-        start = datetime.strptime(settings.quiet_start, "%H:%M").time()
-        end = datetime.strptime(settings.quiet_end, "%H:%M").time()
-
         self.quiet_start = QTimeEdit()
         self.quiet_start.setDisplayFormat("HH:mm")
-        self.quiet_start.setTime(start)
+        self.quiet_start.setTime(datetime.strptime(settings.quiet_start, "%H:%M").time())
 
         self.quiet_end = QTimeEdit()
         self.quiet_end.setDisplayFormat("HH:mm")
-        self.quiet_end.setTime(end)
+        self.quiet_end.setTime(datetime.strptime(settings.quiet_end, "%H:%M").time())
 
         self.auto_dismiss = QCheckBox("Auto-dismiss popup on focus loss")
         self.auto_dismiss.setChecked(settings.popup_auto_dismiss_on_focus_loss)
@@ -335,16 +361,14 @@ class SettingsDialog(QDialog):
         reset_btn = QPushButton("Reset Database")
         reset_btn.clicked.connect(self.reset_requested.emit)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
+        controls = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        controls.accepted.connect(self._save)
+        controls.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(reset_btn)
-        layout.addWidget(buttons)
+        layout.addWidget(controls)
 
     def _save(self) -> None:
         self.settings_saved.emit(
@@ -361,18 +385,19 @@ class SettingsDialog(QDialog):
 
 
 class TodayReportDialog(QDialog):
-    def __init__(self, rows: list[sqlite3.Row], total: int):
+    def __init__(self, rows: list[sqlite3.Row], total: int, on_export: callable):
         super().__init__()
+        self._on_export = on_export
         self.setWindowTitle("Today's Report")
-        self.setMinimumSize(920, 480)
+        self.setMinimumSize(960, 500)
 
         heading = QLabel(f"Context Switch Score today: <b>{total}</b>")
         heading.setTextFormat(Qt.TextFormat.RichText)
 
-        table = QTableWidget(len(rows), 4)
-        table.setHorizontalHeaderLabels(["Time", "From", "To", "Micro-task"])
-        table.verticalHeader().setVisible(False)
-        table.setAlternatingRowColors(True)
+        self.table = QTableWidget(len(rows), 4)
+        self.table.setHorizontalHeaderLabels(["Time", "From", "To", "Micro-task"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
 
         for i, row in enumerate(rows):
             stamp = row["timestamp"].replace("T", " ")[:19]
@@ -380,19 +405,27 @@ class TodayReportDialog(QDialog):
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                table.setItem(i, c, item)
+                self.table.setItem(i, c, item)
 
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setStretchLastSection(True)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
 
-        close_btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
-        close_btn.rejected.connect(self.reject)
-        close_btn.accepted.connect(self.accept)
+        export_btn = QPushButton("Export CSV")
+        export_btn.clicked.connect(self._on_export)
+
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        close.accepted.connect(self.accept)
+
+        foot = QHBoxLayout()
+        foot.addWidget(export_btn)
+        foot.addStretch()
+        foot.addWidget(close)
 
         layout = QVBoxLayout(self)
         layout.addWidget(heading)
-        layout.addWidget(table)
-        layout.addWidget(close_btn)
+        layout.addWidget(self.table)
+        layout.addLayout(foot)
 
 
 class WindowTracker(QObject):
@@ -403,30 +436,32 @@ class WindowTracker(QObject):
         self._watchdogs: dict[str, Any] = {}
         self._windows: dict[str, Any] = {}
         self._active_key: str | None = None
-        self._active_poll = QTimer(self)
-        self._active_poll.timeout.connect(self._poll_active_fallback)
 
         self._refresh_timer = QTimer(self)
         self._refresh_timer.timeout.connect(self.refresh_watchdogs)
 
+        self._fallback_timer = QTimer(self)
+        self._fallback_timer.timeout.connect(self._poll_active_fallback)
+
     def start(self) -> None:
         self.refresh_watchdogs()
-        self._refresh_timer.start(5000)
-        self._active_poll.start(1200)  # fallback if platform watchdog callback is unreliable
-        active = self._safe_active()
+        self._refresh_timer.start(WATCHDOG_REFRESH_MS)
+        self._fallback_timer.start(ACTIVE_FALLBACK_POLL_MS)
+
+        active = self._safe_active_window()
         if active is not None:
             self._active_key = self._window_key(active)
 
     def stop(self) -> None:
         self._refresh_timer.stop()
-        self._active_poll.stop()
+        self._fallback_timer.stop()
         for key in list(self._watchdogs.keys()):
             window = self._windows.get(key)
             if window is not None:
                 try:
                     window.watchdog.stop()
                 except Exception:
-                    pass
+                    LOGGER.debug("Failed stopping watchdog", exc_info=True)
         self._watchdogs.clear()
         self._windows.clear()
 
@@ -434,13 +469,14 @@ class WindowTracker(QObject):
         try:
             windows = pywinctl.getAllWindows()
         except Exception:
+            LOGGER.debug("getAllWindows failed", exc_info=True)
             return
 
         seen: set[str] = set()
-        for win in windows:
-            key = self._window_key(win)
+        for window in windows:
+            key = self._window_key(window)
             seen.add(key)
-            self._windows[key] = win
+            self._windows[key] = window
             if key in self._watchdogs:
                 continue
 
@@ -449,10 +485,10 @@ class WindowTracker(QObject):
                     self._on_activated(k)
 
             try:
-                win.watchdog.start(isActiveCB=_active_cb, interval=0.5)
-                self._watchdogs[key] = win.watchdog
+                window.watchdog.start(isActiveCB=_active_cb, interval=WATCHDOG_INTERVAL)
+                self._watchdogs[key] = window.watchdog
             except Exception:
-                continue
+                LOGGER.debug("Failed creating watchdog for window", exc_info=True)
 
         stale = set(self._watchdogs.keys()) - seen
         for key in stale:
@@ -461,17 +497,17 @@ class WindowTracker(QObject):
                 try:
                     window.watchdog.stop()
                 except Exception:
-                    pass
+                    LOGGER.debug("Failed stopping stale watchdog", exc_info=True)
             self._watchdogs.pop(key, None)
             self._windows.pop(key, None)
 
     def _poll_active_fallback(self) -> None:
-        win = self._safe_active()
-        if win is None:
+        active = self._safe_active_window()
+        if active is None:
             return
-        key = self._window_key(win)
+        key = self._window_key(active)
         if key != self._active_key:
-            self._windows[key] = win
+            self._windows[key] = active
             self._on_activated(key)
 
     def _on_activated(self, key: str) -> None:
@@ -482,37 +518,39 @@ class WindowTracker(QObject):
         self._active_key = key
 
         prev_win = self._windows.get(prev_key) if prev_key else None
-        next_win = self._windows.get(key)
+        new_win = self._windows.get(key)
+
         self.switched.emit(
             {
                 "timestamp": now,
                 "previous_key": prev_key,
                 "new_key": key,
                 "previous_title": self._window_label(prev_win),
-                "new_title": self._window_label(next_win),
+                "new_title": self._window_label(new_win),
             }
         )
 
     @staticmethod
-    def _window_key(win: Any) -> str:
+    def _window_key(window: Any) -> str:
         try:
-            return str(win.getHandle())
+            return str(window.getHandle())
         except Exception:
-            return str(id(win))
+            return str(id(window))
 
     @staticmethod
-    def _window_label(win: Any) -> str:
-        if win is None:
+    def _window_label(window: Any) -> str:
+        if window is None:
             return "Unknown"
+
         try:
-            title = (win.title or "").strip()
+            title = (window.title or "").strip()
             if title:
                 return title
         except Exception:
             pass
 
         try:
-            app_name = (win.getAppName() or "").strip()
+            app_name = (window.getAppName() or "").strip()
             if app_name:
                 return app_name
         except Exception:
@@ -520,7 +558,7 @@ class WindowTracker(QObject):
 
         if psutil is not None:
             try:
-                pid = win.getPID()
+                pid = window.getPID()
                 if pid:
                     return psutil.Process(pid).name()
             except Exception:
@@ -529,7 +567,7 @@ class WindowTracker(QObject):
         return "Unknown Window"
 
     @staticmethod
-    def _safe_active():
+    def _safe_active_window() -> Any | None:
         try:
             return pywinctl.getActiveWindow()
         except Exception:
@@ -551,24 +589,28 @@ class TrayController(QObject):
         self.last_switch_time: datetime | None = None
         self.last_switch_pair: tuple[str, str] | None = None
 
-        app = QApplication.instance()
-        if app is None:
-            raise RuntimeError("QApplication must be initialized before TrayController")
-
         self.tray = QSystemTrayIcon(self)
         self.tray.setIcon(self._build_count_icon(0))
 
         self.menu = QMenu()
+        self.action_pause = QAction("Pause Tracking", self.menu)
+        self.action_pause.setCheckable(True)
+        self.action_pause.setChecked(self.settings.pause_tracking)
+        self.action_pause.triggered.connect(self.toggle_pause)
+
         self.action_settings = QAction("Open Settings", self.menu)
+        self.action_settings.triggered.connect(self.open_settings)
+
         self.action_report = QAction("View Today's Report", self.menu)
+        self.action_report.triggered.connect(self.open_report)
+
         self.action_score = QAction("Context Switch Score: 0", self.menu)
         self.action_score.setEnabled(False)
-        self.action_quit = QAction("Quit", self.menu)
 
-        self.action_settings.triggered.connect(self.open_settings)
-        self.action_report.triggered.connect(self.open_report)
+        self.action_quit = QAction("Quit", self.menu)
         self.action_quit.triggered.connect(self.quit)
 
+        self.menu.addAction(self.action_pause)
         self.menu.addAction(self.action_settings)
         self.menu.addAction(self.action_report)
         self.menu.addAction(self.action_score)
@@ -585,7 +627,15 @@ class TrayController(QObject):
         self.status_timer.start(30_000)
         self.update_status()
 
+    def toggle_pause(self, checked: bool) -> None:
+        self.settings.pause_tracking = checked
+        self.db.save_settings(self.settings)
+        self.update_status()
+
     def _on_switch(self, event: dict[str, Any]) -> None:
+        if self.settings.pause_tracking:
+            return
+
         ts: datetime = event["timestamp"]
         prev_key: str | None = event["previous_key"]
         new_key: str = event["new_key"]
@@ -608,7 +658,7 @@ class TrayController(QObject):
         away_start = self.last_left_at.get(new_key)
         if away_start is not None:
             away_seconds = (ts - away_start).total_seconds()
-            if away_seconds >= self.settings.away_threshold_sec and not self._is_quiet_hour(ts.time()):
+            if away_seconds >= self.settings.away_threshold_sec and not self._is_in_quiet_hours(ts.time()):
                 cursor = QCursor.pos()
                 popup_pos = QPoint(
                     cursor.x() + self.settings.popup_offset_x,
@@ -625,7 +675,7 @@ class TrayController(QObject):
             return False
         return self.last_switch_pair == (new_key, prev_key)
 
-    def _is_quiet_hour(self, current: dtime) -> bool:
+    def _is_in_quiet_hours(self, current: dtime) -> bool:
         start = datetime.strptime(self.settings.quiet_start, "%H:%M").time()
         end = datetime.strptime(self.settings.quiet_end, "%H:%M").time()
         if start == end:
@@ -639,13 +689,15 @@ class TrayController(QObject):
             self.db.update_micro_task(switch_id, text)
 
     def update_status(self) -> None:
-        hour_count = self.db.get_hour_count()
-        day_count = self.db.get_day_count()
-        self.tray.setToolTip(f"ResumeFlow\nThis hour: {hour_count}\nToday: {day_count}")
-        self.action_score.setText(f"Context Switch Score: {day_count}")
-        self.tray.setIcon(self._build_count_icon(hour_count))
+        hour = self.db.get_hour_count()
+        day = self.db.get_day_count()
+        state = "Paused" if self.settings.pause_tracking else "Active"
+        self.tray.setToolTip(f"ResumeFlow ({state})\nThis hour: {hour}\nToday: {day}")
+        self.action_score.setText(f"Context Switch Score: {day}")
+        self.tray.setIcon(self._build_count_icon(hour))
 
-    def _build_count_icon(self, hour_count: int) -> QIcon:
+    @staticmethod
+    def _build_count_icon(hour_count: int) -> QIcon:
         text = str(min(hour_count, 99))
         pix = QPixmap(64, 64)
         pix.fill(Qt.GlobalColor.transparent)
@@ -653,71 +705,113 @@ class TrayController(QObject):
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        painter.setBrush(QColor("#2f9e44"))
+        painter.setBrush(QColor("#16a34a"))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(2, 2, 60, 60)
 
-        painter.setPen(QPen(QColor("#ffffff")))
-        font = QFont("Sans Serif", 25, QFont.Weight.Bold)
-        painter.setFont(font)
+        painter.setPen(QPen(QColor("white")))
+        painter.setFont(QFont("Sans Serif", 24, QFont.Weight.Bold))
         painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, text)
         painter.end()
+
         return QIcon(pix)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.settings)
         dialog.settings_saved.connect(self._save_settings)
-        dialog.reset_requested.connect(self._request_reset)
+        dialog.reset_requested.connect(self._confirm_reset_db)
         dialog.exec()
 
     def _save_settings(self, settings: AppSettings) -> None:
+        settings.pause_tracking = self.settings.pause_tracking
         self.settings = settings
-        self.db.save_settings(settings)
-        self.popup.configure(settings.popup_auto_dismiss_on_focus_loss)
+        self.db.save_settings(self.settings)
+        self.popup.configure(self.settings.popup_auto_dismiss_on_focus_loss)
 
-    def _request_reset(self) -> None:
-        confirmed = QMessageBox.question(
+    def _confirm_reset_db(self) -> None:
+        reply = QMessageBox.question(
             None,
             "Reset Database",
             "Delete all logged context switches?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
-        if confirmed == QMessageBox.StandardButton.Yes:
+        if reply == QMessageBox.StandardButton.Yes:
             self.db.reset_switches()
             self.update_status()
 
     def open_report(self) -> None:
-        rows = self.db.get_today_rows(limit=100)
+        rows = self.db.get_today_rows(limit=200)
         total = self.db.get_day_count()
-        dialog = TodayReportDialog(rows, total)
+        dialog = TodayReportDialog(rows, total, self.export_today_csv)
         dialog.exec()
+
+    def export_today_csv(self) -> None:
+        rows = self.db.get_today_rows(limit=10_000)
+        default = str(APP_DIR / f"resumeflow-report-{datetime.now().strftime('%Y%m%d')}.csv")
+        path, _ = QFileDialog.getSaveFileName(None, "Export Today's Report", default, "CSV Files (*.csv)")
+        if not path:
+            return
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestamp", "previous_window_title", "new_window_title", "micro_task"])
+            for row in rows:
+                writer.writerow([row["timestamp"], row["previous_window_title"], row["new_window_title"], row["micro_task"]])
+
+        QMessageBox.information(None, "ResumeFlow", f"Report exported:\n{path}")
 
     def quit(self) -> None:
         self.tracker.stop()
         self.tray.hide()
+        self.db.close()
         QApplication.quit()
+
+
+def setup_logging() -> None:
+    handler = RotatingFileHandler(LOG_PATH, maxBytes=2_000_000, backupCount=2, encoding="utf-8")
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler.setFormatter(formatter)
+
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.addHandler(handler)
+
+
+def install_exception_hook() -> None:
+    def _hook(exc_type, exc_value, exc_tb):
+        text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        LOGGER.error("Unhandled exception:\n%s", text)
+        QMessageBox.critical(None, APP_NAME, f"Unexpected error:\n{exc_value}")
+
+    sys.excepthook = _hook
 
 
 def build_app() -> QApplication:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
-
     app.setStyle("Fusion")
     return app
 
 
 def main() -> int:
+    setup_logging()
     app = build_app()
+    install_exception_hook()
+
+    if not QSystemTrayIcon.isSystemTrayAvailable():
+        QMessageBox.critical(None, APP_NAME, "System tray is unavailable on this system.")
+        return 1
 
     db = DatabaseManager(DB_PATH)
     tracker = WindowTracker()
-    tray_controller = TrayController(db, tracker)
-    _ = tray_controller
+    controller = TrayController(db, tracker)
+    _ = controller
 
     try:
         tracker.start()
+        LOGGER.info("ResumeFlow started")
     except Exception as exc:
+        LOGGER.exception("Window tracking startup failed")
         QMessageBox.warning(None, APP_NAME, f"Window tracking startup failed:\n{exc}")
 
     return app.exec()
