@@ -8,6 +8,7 @@ Install dependencies:
 from __future__ import annotations
 
 import csv
+import importlib
 import logging
 import sqlite3
 import sys
@@ -47,7 +48,6 @@ try:
 except Exception:  # optional dependency
     psutil = None
 
-import pywinctl
 
 APP_NAME = "ResumeFlow"
 APP_DIR = Path.home() / ".resumeflow"
@@ -66,6 +66,17 @@ OFFSET_MIN = -500
 OFFSET_MAX = 500
 
 LOGGER = logging.getLogger(APP_NAME)
+
+
+def load_pywinctl() -> Any:
+    """Lazily load pywinctl to surface friendly runtime errors."""
+    try:
+        return importlib.import_module("pywinctl")
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to load pywinctl. Ensure desktop session/window permissions are enabled and "
+            "dependency is installed: pip install pywinctl"
+        ) from exc
 
 
 @dataclass
@@ -451,8 +462,9 @@ class TodayReportDialog(QDialog):
 class WindowTracker(QObject):
     switched = pyqtSignal(dict)
 
-    def __init__(self) -> None:
+    def __init__(self, pywinctl_module: Any) -> None:
         super().__init__()
+        self._pywinctl = pywinctl_module
         self._watchdogs: dict[str, Any] = {}
         self._windows: dict[str, Any] = {}
         self._active_key: str | None = None
@@ -487,7 +499,7 @@ class WindowTracker(QObject):
 
     def refresh_watchdogs(self) -> None:
         try:
-            windows = pywinctl.getAllWindows()
+            windows = self._pywinctl.getAllWindows()
         except Exception:
             LOGGER.debug("getAllWindows failed", exc_info=True)
             return
@@ -589,7 +601,7 @@ class WindowTracker(QObject):
     @staticmethod
     def _safe_active_window() -> Any | None:
         try:
-            return pywinctl.getActiveWindow()
+            return self._pywinctl.getActiveWindow()
         except Exception:
             return None
 
@@ -867,7 +879,15 @@ def main() -> int:
         return 1
 
     db = DatabaseManager(DB_PATH)
-    tracker = WindowTracker()
+    try:
+        pywinctl_module = load_pywinctl()
+    except RuntimeError as exc:
+        QMessageBox.critical(None, APP_NAME, f"{exc}\n\nTips:\n- Run inside a desktop session (not headless SSH).\n- Linux: ensure DISPLAY is set and X11/Wayland access is allowed.\n- macOS: enable Accessibility permissions for terminal/python.")
+        LOGGER.exception("Failed to import pywinctl")
+        db.close()
+        return 1
+
+    tracker = WindowTracker(pywinctl_module)
     controller = TrayController(db, tracker)
     _ = controller
 
