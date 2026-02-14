@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ResumeFlow - production-ready local desktop context switch tracker.
+"""ResumeFlow - local full-stack desktop context switch tracker.
 
 Install dependencies:
     pip install pyqt6 pywinctl psutil
@@ -9,18 +9,33 @@ from __future__ import annotations
 
 import csv
 import importlib
+import json
 import logging
 import sqlite3
 import sys
+import threading
 import traceback
+import webbrowser
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlparse
 
-from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -64,12 +79,13 @@ ACTIVE_FALLBACK_POLL_MS = 1200
 MAX_POPUP_AWAY_SECONDS = 8 * 60 * 60
 OFFSET_MIN = -500
 OFFSET_MAX = 500
+WEB_HOST = "127.0.0.1"
+WEB_PORT = 8765
 
 LOGGER = logging.getLogger(APP_NAME)
 
 
 def load_pywinctl() -> Any:
-    """Lazily load pywinctl to surface friendly runtime errors."""
     try:
         return importlib.import_module("pywinctl")
     except Exception as exc:
@@ -91,7 +107,6 @@ class AppSettings:
 
 
 def parse_hhmm(value: str, fallback: str) -> dtime:
-    """Parse HH:MM safely and fall back on invalid persisted values."""
     try:
         return datetime.strptime(value, "%H:%M").time()
     except Exception:
@@ -99,7 +114,6 @@ def parse_hhmm(value: str, fallback: str) -> dtime:
 
 
 def is_within_quiet_hours(current: dtime, start: dtime, end: dtime) -> bool:
-    """Return True when current is inside quiet hours window."""
     if start == end:
         return False
     if start < end:
@@ -109,49 +123,52 @@ def is_within_quiet_hours(current: dtime, start: dtime, end: dtime) -> bool:
 
 class DatabaseManager:
     def __init__(self, db_path: Path):
-        self.conn = sqlite3.connect(db_path)
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._configure_connection()
         self._migrate()
 
     def _configure_connection(self) -> None:
-        with self.conn:
-            self.conn.execute("PRAGMA journal_mode = WAL")
-            self.conn.execute("PRAGMA synchronous = NORMAL")
-            self.conn.execute("PRAGMA temp_store = MEMORY")
-            self.conn.execute("PRAGMA foreign_keys = ON")
+        with self._lock:
+            with self.conn:
+                self.conn.execute("PRAGMA journal_mode = WAL")
+                self.conn.execute("PRAGMA synchronous = NORMAL")
+                self.conn.execute("PRAGMA temp_store = MEMORY")
+                self.conn.execute("PRAGMA foreign_keys = ON")
 
     def _migrate(self) -> None:
-        with self.conn:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS switches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp TEXT NOT NULL,
-                    previous_window_title TEXT,
-                    new_window_title TEXT,
-                    micro_task TEXT
+        with self._lock:
+            with self.conn:
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS switches (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        previous_window_title TEXT,
+                        new_window_title TEXT,
+                        micro_task TEXT
+                    )
+                    """
                 )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+                self.conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            self.conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_switches_timestamp ON switches(timestamp)"
-            )
+                self.conn.execute("CREATE INDEX IF NOT EXISTS idx_switches_timestamp ON switches(timestamp)")
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
     def load_settings(self) -> AppSettings:
         base = AppSettings()
-        rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
+        with self._lock:
+            rows = self.conn.execute("SELECT key, value FROM settings").fetchall()
         kv = {r["key"]: r["value"] for r in rows}
 
         base.away_threshold_sec = max(
@@ -176,70 +193,93 @@ class DatabaseManager:
             "popup_auto_dismiss_on_focus_loss": "1" if settings.popup_auto_dismiss_on_focus_loss else "0",
             "pause_tracking": "1" if settings.pause_tracking else "0",
         }
-        with self.conn:
-            for k, v in values.items():
-                self.conn.execute(
-                    "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (k, v),
-                )
+        with self._lock:
+            with self.conn:
+                for k, v in values.items():
+                    self.conn.execute(
+                        "INSERT INTO settings(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (k, v),
+                    )
 
     def insert_switch(self, timestamp: datetime, previous_title: str, new_title: str) -> int:
-        with self.conn:
-            cur = self.conn.execute(
-                """
-                INSERT INTO switches(timestamp, previous_window_title, new_window_title, micro_task)
-                VALUES(?, ?, ?, NULL)
-                """,
-                (timestamp.isoformat(), previous_title, new_title),
-            )
-            return int(cur.lastrowid)
+        with self._lock:
+            with self.conn:
+                cur = self.conn.execute(
+                    """
+                    INSERT INTO switches(timestamp, previous_window_title, new_window_title, micro_task)
+                    VALUES(?, ?, ?, NULL)
+                    """,
+                    (timestamp.isoformat(), previous_title, new_title),
+                )
+                return int(cur.lastrowid)
 
     def update_micro_task(self, switch_id: int, task_text: str) -> None:
-        with self.conn:
-            self.conn.execute(
-                "UPDATE switches SET micro_task = ? WHERE id = ?",
-                (task_text.strip() or None, switch_id),
-            )
+        with self._lock:
+            with self.conn:
+                self.conn.execute("UPDATE switches SET micro_task = ? WHERE id = ?", (task_text.strip() or None, switch_id))
 
     def get_hour_count(self, now: datetime | None = None) -> int:
         now = now or datetime.now()
         start = now.replace(minute=0, second=0, microsecond=0)
         end = start.replace(minute=59, second=59, microsecond=999999)
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM switches WHERE timestamp BETWEEN ? AND ?",
-            (start.isoformat(), end.isoformat()),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM switches WHERE timestamp BETWEEN ? AND ?",
+                (start.isoformat(), end.isoformat()),
+            ).fetchone()
         return int(row["c"]) if row else 0
 
     def get_day_count(self, day: datetime | None = None) -> int:
         day = day or datetime.now()
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS c FROM switches WHERE timestamp BETWEEN ? AND ?",
-            (start.isoformat(), end.isoformat()),
-        ).fetchone()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS c FROM switches WHERE timestamp BETWEEN ? AND ?",
+                (start.isoformat(), end.isoformat()),
+            ).fetchone()
         return int(row["c"]) if row else 0
 
     def get_today_rows(self, limit: int = 100) -> list[sqlite3.Row]:
         day = datetime.now()
         start = day.replace(hour=0, minute=0, second=0, microsecond=0)
         end = day.replace(hour=23, minute=59, second=59, microsecond=999999)
-        return self.conn.execute(
-            """
-            SELECT id, timestamp, previous_window_title, new_window_title, micro_task
-            FROM switches
-            WHERE timestamp BETWEEN ? AND ?
-            ORDER BY timestamp DESC
-            LIMIT ?
-            """,
-            (start.isoformat(), end.isoformat(), limit),
-        ).fetchall()
+        with self._lock:
+            rows = self.conn.execute(
+                """
+                SELECT id, timestamp, previous_window_title, new_window_title, micro_task
+                FROM switches
+                WHERE timestamp BETWEEN ? AND ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+                """,
+                (start.isoformat(), end.isoformat(), limit),
+            ).fetchall()
+        return rows
 
     def reset_switches(self) -> None:
-        with self.conn:
-            self.conn.execute("DELETE FROM switches")
-        self.conn.execute("VACUUM")
+        with self._lock:
+            with self.conn:
+                self.conn.execute("DELETE FROM switches")
+            self.conn.execute("VACUUM")
+
+    def get_dashboard_payload(self, limit: int = 100) -> dict[str, Any]:
+        rows = self.get_today_rows(limit=limit)
+        return {
+            "generated_at": datetime.now().isoformat(),
+            "today_count": self.get_day_count(),
+            "hour_count": self.get_hour_count(),
+            "rows": [
+                {
+                    "id": int(r["id"]),
+                    "timestamp": r["timestamp"],
+                    "previous_window_title": r["previous_window_title"],
+                    "new_window_title": r["new_window_title"],
+                    "micro_task": r["micro_task"],
+                }
+                for r in rows
+            ],
+        }
 
     @staticmethod
     def _safe_int(v: str | None, fallback: int) -> int:
@@ -247,6 +287,148 @@ class DatabaseManager:
             return int(v) if v is not None else fallback
         except ValueError:
             return fallback
+
+
+class WebDashboardServer:
+    def __init__(self, db: DatabaseManager, host: str = WEB_HOST, port: int = WEB_PORT):
+        self.db = db
+        self.host = host
+        self.port = port
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def start(self) -> None:
+        app_ref = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                parsed = urlparse(self.path)
+                path = parsed.path
+                qs = parse_qs(parsed.query)
+
+                if path == "/" or path == "/dashboard":
+                    body = app_ref._dashboard_html().encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+
+                if path == "/api/health":
+                    app_ref._send_json(self, {"ok": True, "service": APP_NAME, "time": datetime.now().isoformat()})
+                    return
+
+                if path == "/api/stats":
+                    app_ref._send_json(
+                        self,
+                        {
+                            "today_count": app_ref.db.get_day_count(),
+                            "hour_count": app_ref.db.get_hour_count(),
+                            "time": datetime.now().isoformat(),
+                        },
+                    )
+                    return
+
+                if path == "/api/switches":
+                    limit = 100
+                    try:
+                        if "limit" in qs:
+                            limit = max(1, min(1000, int(qs["limit"][0])))
+                    except Exception:
+                        limit = 100
+                    app_ref._send_json(self, app_ref.db.get_dashboard_payload(limit=limit))
+                    return
+
+                app_ref._send_json(self, {"error": "Not found"}, status=404)
+
+            def log_message(self, fmt: str, *args) -> None:
+                LOGGER.debug("WEB %s", fmt % args)
+
+        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+        self._thread.start()
+        LOGGER.info("Web dashboard running at %s", self.base_url)
+
+    def stop(self) -> None:
+        if self._httpd:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+            self._httpd = None
+
+    @staticmethod
+    def _send_json(handler: BaseHTTPRequestHandler, payload: dict[str, Any], status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    @staticmethod
+    def _dashboard_html() -> str:
+        return """<!doctype html>
+<html>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>ResumeFlow Dashboard</title>
+<style>
+body { font-family: Inter, Segoe UI, Arial, sans-serif; margin: 24px; background:#0f172a; color:#e2e8f0; }
+.card { background:#111827; border:1px solid #334155; border-radius:12px; padding:16px; margin-bottom:16px; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:12px; }
+.kpi { background:#1e293b; border-radius:10px; padding:12px; }
+.kpi h3 { margin:0 0 4px 0; font-size:13px; color:#94a3b8; }
+.kpi p { margin:0; font-size:24px; font-weight:700; }
+button { background:#2563eb; color:white; border:none; border-radius:8px; padding:8px 12px; cursor:pointer; }
+button:hover { background:#3b82f6; }
+table { width:100%; border-collapse:collapse; }
+th, td { text-align:left; padding:8px; border-bottom:1px solid #334155; font-size:13px; }
+th { color:#93c5fd; }
+.small { color:#94a3b8; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>ResumeFlow Dashboard</h1>
+<div class='card grid'>
+  <div class='kpi'><h3>Switches this hour</h3><p id='hour'>-</p></div>
+  <div class='kpi'><h3>Switches today</h3><p id='day'>-</p></div>
+  <div class='kpi'><h3>Last refresh</h3><p id='refresh' class='small'>-</p></div>
+</div>
+<div class='card'>
+  <button onclick='loadData()'>Refresh</button>
+  <span class='small' style='margin-left:8px'>Data updates every 15s.</span>
+</div>
+<div class='card'>
+  <table>
+    <thead><tr><th>Time</th><th>From</th><th>To</th><th>Micro-task</th></tr></thead>
+    <tbody id='rows'></tbody>
+  </table>
+</div>
+<script>
+async function loadData() {
+  const data = await fetch('/api/switches?limit=150').then(r=>r.json());
+  document.getElementById('hour').textContent = data.hour_count;
+  document.getElementById('day').textContent = data.today_count;
+  document.getElementById('refresh').textContent = new Date().toLocaleTimeString();
+  const tbody = document.getElementById('rows');
+  tbody.innerHTML = '';
+  for (const row of data.rows) {
+    const tr = document.createElement('tr');
+    const ts = (row.timestamp || '').replace('T',' ').slice(0,19);
+    tr.innerHTML = `<td>${ts}</td><td>${row.previous_window_title || ''}</td><td>${row.new_window_title || ''}</td><td>${row.micro_task || ''}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+loadData();
+setInterval(loadData, 15000);
+</script>
+</body>
+</html>"""
 
 
 class ResumePopup(QFrame):
@@ -288,13 +470,12 @@ class ResumePopup(QFrame):
         )
 
         self.info_label = QLabel()
-        self.info_label.setWordWrap(True)
         self.work_label = QLabel()
+        self.info_label.setWordWrap(True)
         self.work_label.setWordWrap(True)
 
-        text_label = QLabel("Next micro-task (optional):")
         self.task_input = QLineEdit()
-        self.task_input.setPlaceholderText("e.g., Finalize section intro")
+        self.task_input.setPlaceholderText("Next micro-task (optional)")
         self.task_input.returnPressed.connect(self._submit)
 
         ok_btn = QPushButton("OK")
@@ -305,7 +486,7 @@ class ResumePopup(QFrame):
         card_layout.setSpacing(8)
         card_layout.addWidget(self.info_label)
         card_layout.addWidget(self.work_label)
-        card_layout.addWidget(text_label)
+        card_layout.addWidget(QLabel("Next micro-task (optional):"))
         card_layout.addWidget(self.task_input)
         card_layout.addWidget(ok_btn, alignment=Qt.AlignmentFlag.AlignRight)
 
@@ -418,17 +599,16 @@ class SettingsDialog(QDialog):
 class TodayReportDialog(QDialog):
     def __init__(self, rows: list[sqlite3.Row], total: int, on_export: Callable[[], None]):
         super().__init__()
-        self._on_export = on_export
         self.setWindowTitle("Today's Report")
         self.setMinimumSize(960, 500)
 
         heading = QLabel(f"Context Switch Score today: <b>{total}</b>")
         heading.setTextFormat(Qt.TextFormat.RichText)
 
-        self.table = QTableWidget(len(rows), 4)
-        self.table.setHorizontalHeaderLabels(["Time", "From", "To", "Micro-task"])
-        self.table.verticalHeader().setVisible(False)
-        self.table.setAlternatingRowColors(True)
+        table = QTableWidget(len(rows), 4)
+        table.setHorizontalHeaderLabels(["Time", "From", "To", "Micro-task"])
+        table.verticalHeader().setVisible(False)
+        table.setAlternatingRowColors(True)
 
         for i, row in enumerate(rows):
             stamp = row["timestamp"].replace("T", " ")[:19]
@@ -436,13 +616,13 @@ class TodayReportDialog(QDialog):
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                self.table.setItem(i, c, item)
+                table.setItem(i, c, item)
 
-        self.table.resizeColumnsToContents()
-        self.table.horizontalHeader().setStretchLastSection(True)
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
 
         export_btn = QPushButton("Export CSV")
-        export_btn.clicked.connect(self._on_export)
+        export_btn.clicked.connect(on_export)
 
         close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         close.rejected.connect(self.reject)
@@ -455,7 +635,7 @@ class TodayReportDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(heading)
-        layout.addWidget(self.table)
+        layout.addWidget(table)
         layout.addLayout(foot)
 
 
@@ -598,8 +778,7 @@ class WindowTracker(QObject):
 
         return "Unknown Window"
 
-    @staticmethod
-    def _safe_active_window() -> Any | None:
+    def _safe_active_window(self) -> Any | None:
         try:
             return self._pywinctl.getActiveWindow()
         except Exception:
@@ -607,10 +786,11 @@ class WindowTracker(QObject):
 
 
 class TrayController(QObject):
-    def __init__(self, db: DatabaseManager, tracker: WindowTracker):
+    def __init__(self, db: DatabaseManager, tracker: WindowTracker, web_server: WebDashboardServer):
         super().__init__()
         self.db = db
         self.tracker = tracker
+        self.web_server = web_server
         self.settings = self.db.load_settings()
 
         self.popup = ResumePopup()
@@ -636,6 +816,9 @@ class TrayController(QObject):
         self.action_report = QAction("View Today's Report", self.menu)
         self.action_report.triggered.connect(self.open_report)
 
+        self.action_dashboard = QAction("Open Web Dashboard", self.menu)
+        self.action_dashboard.triggered.connect(self.open_web_dashboard)
+
         self.action_open_data = QAction("Open Data Folder", self.menu)
         self.action_open_data.triggered.connect(self.open_data_folder)
 
@@ -651,6 +834,7 @@ class TrayController(QObject):
         self.menu.addAction(self.action_pause)
         self.menu.addAction(self.action_settings)
         self.menu.addAction(self.action_report)
+        self.menu.addAction(self.action_dashboard)
         self.menu.addAction(self.action_open_data)
         self.menu.addAction(self.action_open_logs)
         self.menu.addAction(self.action_score)
@@ -671,8 +855,7 @@ class TrayController(QObject):
         self.settings.pause_tracking = checked
         self.db.save_settings(self.settings)
         self.update_status()
-        state_msg = "Tracking paused" if checked else "Tracking resumed"
-        self.tray.showMessage(APP_NAME, state_msg, QSystemTrayIcon.MessageIcon.Information, 1500)
+        self.tray.showMessage(APP_NAME, "Tracking paused" if checked else "Tracking resumed", QSystemTrayIcon.MessageIcon.Information, 1500)
 
     def _on_switch(self, event: dict[str, Any]) -> None:
         if self.settings.pause_tracking:
@@ -700,10 +883,7 @@ class TrayController(QObject):
         away_start = self.last_left_at.get(new_key)
         if away_start is not None:
             away_seconds = (ts - away_start).total_seconds()
-            if (
-                self.settings.away_threshold_sec <= away_seconds <= MAX_POPUP_AWAY_SECONDS
-                and not self._is_in_quiet_hours(ts.time())
-            ):
+            if self.settings.away_threshold_sec <= away_seconds <= MAX_POPUP_AWAY_SECONDS and not self._is_in_quiet_hours(ts.time()):
                 cursor = QCursor.pos()
                 popup_pos = self._safe_popup_pos(
                     cursor.x() + self.settings.popup_offset_x,
@@ -726,7 +906,6 @@ class TrayController(QObject):
         return is_within_quiet_hours(current, start, end)
 
     def _safe_popup_pos(self, x: int, y: int) -> QPoint:
-        """Clamp popup position to the available screen to avoid off-screen windows."""
         screen = QApplication.screenAt(QPoint(x, y)) or QApplication.primaryScreen()
         if screen is None:
             return QPoint(x, y)
@@ -746,7 +925,7 @@ class TrayController(QObject):
         hour = self.db.get_hour_count()
         day = self.db.get_day_count()
         state = "Paused" if self.settings.pause_tracking else "Active"
-        self.tray.setToolTip(f"ResumeFlow ({state})\nThis hour: {hour}\nToday: {day}")
+        self.tray.setToolTip(f"ResumeFlow ({state})\nThis hour: {hour}\nToday: {day}\nDashboard: {self.web_server.base_url}")
         self.action_score.setText(f"Context Switch Score: {day}")
         self.tray.setIcon(self._build_count_icon(hour))
 
@@ -758,7 +937,6 @@ class TrayController(QObject):
 
         painter = QPainter(pix)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         painter.setBrush(QColor("#16a34a"))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(2, 2, 60, 60)
@@ -767,7 +945,6 @@ class TrayController(QObject):
         painter.setFont(QFont("Sans Serif", 24, QFont.Weight.Bold))
         painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, text)
         painter.end()
-
         return QIcon(pix)
 
     def open_settings(self) -> None:
@@ -817,27 +994,23 @@ class TrayController(QObject):
             QMessageBox.critical(None, APP_NAME, f"Failed to export report:\n{exc}")
             return
 
-        QMessageBox.information(None, "ResumeFlow", f"Report exported:\n{path}")
-        self.tray.showMessage(APP_NAME, "CSV report exported", QSystemTrayIcon.MessageIcon.Information, 2000)
+        QMessageBox.information(None, APP_NAME, f"Report exported:\n{path}")
+
+    def open_web_dashboard(self) -> None:
+        QDesktopServices.openUrl(QUrl(self.web_server.base_url))
 
     def open_data_folder(self) -> None:
-        if not APP_DIR.exists():
-            APP_DIR.mkdir(parents=True, exist_ok=True)
-        from PyQt6.QtGui import QDesktopServices
-        from PyQt6.QtCore import QUrl
-
+        APP_DIR.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(APP_DIR)))
 
     def open_log_file(self) -> None:
         if not LOG_PATH.exists():
             LOG_PATH.touch(exist_ok=True)
-        from PyQt6.QtGui import QDesktopServices
-        from PyQt6.QtCore import QUrl
-
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(LOG_PATH)))
 
     def quit(self) -> None:
         self.tracker.stop()
+        self.web_server.stop()
         self.tray.hide()
         self.db.close()
         QApplication.quit()
@@ -879,17 +1052,29 @@ def main() -> int:
         return 1
 
     db = DatabaseManager(DB_PATH)
+
     try:
         pywinctl_module = load_pywinctl()
     except RuntimeError as exc:
-        QMessageBox.critical(None, APP_NAME, f"{exc}\n\nTips:\n- Run inside a desktop session (not headless SSH).\n- Linux: ensure DISPLAY is set and X11/Wayland access is allowed.\n- macOS: enable Accessibility permissions for terminal/python.")
+        QMessageBox.critical(
+            None,
+            APP_NAME,
+            f"{exc}\n\nTips:\n- Run inside a desktop session (not headless SSH).\n- Linux: ensure DISPLAY is set and X11/Wayland access is allowed.\n- macOS: enable Accessibility permissions for terminal/python.",
+        )
         LOGGER.exception("Failed to import pywinctl")
         db.close()
         return 1
 
     tracker = WindowTracker(pywinctl_module)
-    controller = TrayController(db, tracker)
-    _ = controller
+
+    web_server = WebDashboardServer(db)
+    try:
+        web_server.start()
+    except OSError as exc:
+        LOGGER.exception("Web dashboard failed to bind")
+        QMessageBox.warning(None, APP_NAME, f"Web dashboard failed to start on {web_server.base_url}:\n{exc}")
+
+    _ = TrayController(db, tracker, web_server)
 
     try:
         tracker.start()
