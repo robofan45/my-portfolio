@@ -15,7 +15,7 @@ import sqlite3
 import sys
 import threading
 import traceback
-import webbrowser
+import time
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,39 +24,92 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
-from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import (
-    QAction,
-    QColor,
-    QCursor,
-    QDesktopServices,
-    QFont,
-    QIcon,
-    QPainter,
-    QPen,
-    QPixmap,
-)
-from PyQt6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QDialog,
-    QDialogButtonBox,
-    QFileDialog,
-    QFormLayout,
-    QFrame,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QMenu,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QSystemTrayIcon,
-    QTableWidget,
-    QTableWidgetItem,
-    QTimeEdit,
-    QVBoxLayout,
-)
+try:
+    from PyQt6.QtCore import QObject, QPoint, Qt, QTimer, QUrl, pyqtSignal
+    from PyQt6.QtGui import (
+        QAction,
+        QColor,
+        QCursor,
+        QDesktopServices,
+        QFont,
+        QIcon,
+        QPainter,
+        QPen,
+        QPixmap,
+    )
+    from PyQt6.QtWidgets import (
+        QApplication,
+        QCheckBox,
+        QDialog,
+        QDialogButtonBox,
+        QFileDialog,
+        QFormLayout,
+        QFrame,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QMenu,
+        QMessageBox,
+        QPushButton,
+        QSpinBox,
+        QSystemTrayIcon,
+        QTableWidget,
+        QTableWidgetItem,
+        QTimeEdit,
+        QVBoxLayout,
+    )
+    QT_AVAILABLE = True
+    QT_IMPORT_ERROR: Exception | None = None
+except Exception as qt_exc:
+    QT_AVAILABLE = False
+    QT_IMPORT_ERROR = qt_exc
+
+    class QObject: pass
+    class QDialog: pass
+    class QFrame: pass
+    class QApplication: pass
+    class QSystemTrayIcon: pass
+    class QPoint:
+        def __init__(self, x=0, y=0): self._x=x; self._y=y
+        def x(self): return self._x
+        def y(self): return self._y
+    class QUrl:
+        def __init__(self, *_): pass
+        @staticmethod
+        def fromLocalFile(_): return QUrl()
+    class QTimer:
+        def __init__(self,*_): pass
+        def start(self,*_): pass
+        def stop(self,*_): pass
+        @property
+        def timeout(self):
+            class _T:
+                def connect(self,*_): pass
+            return _T()
+    class Qt:
+        class WindowType:
+            Tool=0; FramelessWindowHint=0; WindowStaysOnTopHint=0
+        class WidgetAttribute:
+            WA_TranslucentBackground=0
+        class FocusPolicy:
+            StrongFocus=0
+        class FocusReason:
+            PopupFocusReason=0
+        class AlignmentFlag:
+            AlignRight=0; AlignCenter=0
+        class PenStyle:
+            NoPen=0
+        class GlobalColor:
+            transparent=0
+        class TextFormat:
+            RichText=0
+        class ItemFlag:
+            ItemIsEditable=0
+    def pyqtSignal(*_args, **_kwargs):
+        class _S:
+            def connect(self,*_): pass
+            def emit(self,*_): pass
+        return _S()
 
 try:
     import psutil
@@ -785,6 +838,85 @@ class WindowTracker(QObject):
             return None
 
 
+class HeadlessTracker:
+    """Non-GUI tracker so app can run in server mode without Qt/OpenGL."""
+
+    def __init__(self, db: DatabaseManager, pywinctl_module: Any):
+        self.db = db
+        self._pywinctl = pywinctl_module
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._active_key: str | None = None
+        self._active_title: str = "Unknown"
+        self._last_switch_time: datetime | None = None
+        self._last_switch_pair: tuple[str, str] | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                win = self._pywinctl.getActiveWindow()
+                if win is None:
+                    time.sleep(1.0)
+                    continue
+                key = self._window_key(win)
+                title = self._window_label(win)
+                if self._active_key is None:
+                    self._active_key = key
+                    self._active_title = title
+                elif key != self._active_key:
+                    now = datetime.now()
+                    if not self._is_noise_switch(now, self._active_key, key):
+                        self.db.insert_switch(now, self._active_title, title)
+                        self._last_switch_time = now
+                        self._last_switch_pair = (self._active_key, key)
+                    self._active_key = key
+                    self._active_title = title
+            except Exception:
+                LOGGER.debug("Headless tracker poll failed", exc_info=True)
+            time.sleep(1.0)
+
+    def _is_noise_switch(self, now: datetime, prev_key: str, new_key: str) -> bool:
+        if self._last_switch_time is None or self._last_switch_pair is None:
+            return False
+        if (now - self._last_switch_time).total_seconds() > NOISE_SWITCH_SECONDS:
+            return False
+        return self._last_switch_pair == (new_key, prev_key)
+
+    @staticmethod
+    def _window_key(window: Any) -> str:
+        try:
+            return str(window.getHandle())
+        except Exception:
+            return str(id(window))
+
+    @staticmethod
+    def _window_label(window: Any) -> str:
+        if window is None:
+            return "Unknown"
+        try:
+            t = (window.title or "").strip()
+            if t:
+                return t
+        except Exception:
+            pass
+        try:
+            n = (window.getAppName() or "").strip()
+            if n:
+                return n
+        except Exception:
+            pass
+        return "Unknown Window"
+
+
 class TrayController(QObject):
     def __init__(self, db: DatabaseManager, tracker: WindowTracker, web_server: WebDashboardServer):
         super().__init__()
@@ -1042,16 +1174,57 @@ def build_app() -> QApplication:
     return app
 
 
+def run_headless(db: DatabaseManager) -> int:
+    LOGGER.warning("Starting in headless mode (Qt unavailable or --headless requested): %s", QT_IMPORT_ERROR)
+    web_server = WebDashboardServer(db)
+    try:
+        web_server.start()
+    except OSError as exc:
+        LOGGER.exception("Web dashboard failed to bind in headless mode")
+        print(f"Failed to start dashboard server: {exc}")
+        db.close()
+        return 1
+
+    tracker: HeadlessTracker | None = None
+    try:
+        pywinctl_module = load_pywinctl()
+        tracker = HeadlessTracker(db, pywinctl_module)
+        tracker.start()
+        LOGGER.info("Headless window tracker started")
+    except Exception:
+        LOGGER.warning("Headless tracker unavailable; running dashboard-only mode", exc_info=True)
+
+    print(f"ResumeFlow running in headless mode at {web_server.base_url}")
+    print("Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tracker:
+            tracker.stop()
+        web_server.stop()
+        db.close()
+    return 0
+
+
 def main() -> int:
     setup_logging()
+
+    headless_forced = "--headless" in sys.argv
+    db = DatabaseManager(DB_PATH)
+
+    if headless_forced or not QT_AVAILABLE:
+        return run_headless(db)
+
     app = build_app()
     install_exception_hook()
 
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(None, APP_NAME, "System tray is unavailable on this system.")
+        db.close()
         return 1
-
-    db = DatabaseManager(DB_PATH)
 
     try:
         pywinctl_module = load_pywinctl()
